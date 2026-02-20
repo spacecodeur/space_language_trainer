@@ -63,6 +63,12 @@ pub fn run(model_path: &str, language: &str) -> Result<()> {
                 write_server_msg(&mut writer, &response)?;
                 writer.flush()?;
             }
+            ClientMsg::PauseRequest => {
+                debug!("Received PauseRequest (not yet implemented)");
+            }
+            ClientMsg::ResumeRequest => {
+                debug!("Received ResumeRequest (not yet implemented)");
+            }
         }
     }
 

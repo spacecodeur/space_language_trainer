@@ -1,19 +1,34 @@
 use anyhow::{Result, bail};
 use std::io::{Read, Write};
 
-// --- Client messages ---
+// --- Client messages (client → server, tags 0x01-0x7F) ---
 
+#[derive(Debug)]
 pub enum ClientMsg {
     AudioSegment(Vec<i16>), // tag 0x01, payload = raw i16 LE bytes
+    PauseRequest,           // tag 0x02, empty payload
+    ResumeRequest,          // tag 0x03, empty payload
 }
 
-// --- Server messages ---
+// --- Server messages (server → client, tags 0x80-0xFF) ---
 
 #[derive(Debug)]
 pub enum ServerMsg {
-    Ready,         // tag 0x80, length = 0
-    Text(String),  // tag 0x81, payload = UTF-8
-    Error(String), // tag 0x82, payload = UTF-8
+    Ready,                   // tag 0x80, empty payload
+    Text(String),            // tag 0x81, payload = UTF-8
+    Error(String),           // tag 0x82, payload = UTF-8
+    TtsAudioChunk(Vec<i16>), // tag 0x83, payload = raw i16 LE bytes
+    TtsEnd,                  // tag 0x84, empty payload
+}
+
+// --- Orchestrator messages (orchestrator ↔ server, tags 0xA0-0xBF, Unix socket) ---
+
+#[derive(Debug)]
+pub enum OrchestratorMsg {
+    TranscribedText(String), // tag 0xA0, payload = UTF-8
+    ResponseText(String),    // tag 0xA1, payload = UTF-8
+    SessionStart(String),    // tag 0xA2, payload = UTF-8 JSON (raw string)
+    SessionEnd,              // tag 0xA3, empty payload
 }
 
 // --- Wire format: [tag: u8][length: u32 LE][payload] ---
@@ -27,6 +42,16 @@ pub fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> Result<()> {
             for &s in samples {
                 w.write_all(&s.to_le_bytes())?;
             }
+            w.flush()?;
+        }
+        ClientMsg::PauseRequest => {
+            w.write_all(&[0x02])?;
+            w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+        ClientMsg::ResumeRequest => {
+            w.write_all(&[0x03])?;
+            w.write_all(&0u32.to_le_bytes())?;
             w.flush()?;
         }
     }
@@ -54,6 +79,20 @@ pub fn read_client_msg(r: &mut impl Read) -> Result<ClientMsg> {
                 .collect();
             Ok(ClientMsg::AudioSegment(samples))
         }
+        0x02 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ClientMsg::PauseRequest)
+        }
+        0x03 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ClientMsg::ResumeRequest)
+        }
         other => bail!("Unknown client message tag: 0x{other:02x}"),
     }
 }
@@ -77,6 +116,20 @@ pub fn write_server_msg(w: &mut impl Write, msg: &ServerMsg) -> Result<()> {
             w.write_all(&[0x82])?;
             w.write_all(&(payload.len() as u32).to_le_bytes())?;
             w.write_all(payload)?;
+            w.flush()?;
+        }
+        ServerMsg::TtsAudioChunk(samples) => {
+            let payload_len = samples.len() * 2; // i16 = 2 bytes
+            w.write_all(&[0x83])?;
+            w.write_all(&(payload_len as u32).to_le_bytes())?;
+            for &s in samples {
+                w.write_all(&s.to_le_bytes())?;
+            }
+            w.flush()?;
+        }
+        ServerMsg::TtsEnd => {
+            w.write_all(&[0x84])?;
+            w.write_all(&0u32.to_le_bytes())?;
             w.flush()?;
         }
     }
@@ -109,7 +162,95 @@ pub fn read_server_msg(r: &mut impl Read) -> Result<ServerMsg> {
             r.read_exact(&mut payload)?;
             Ok(ServerMsg::Error(String::from_utf8(payload)?))
         }
+        0x83 => {
+            if !len.is_multiple_of(2) {
+                bail!("TtsAudioChunk payload length {len} is not a multiple of 2");
+            }
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            let samples: Vec<i16> = payload
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            Ok(ServerMsg::TtsAudioChunk(samples))
+        }
+        0x84 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ServerMsg::TtsEnd)
+        }
         other => bail!("Unknown server message tag: 0x{other:02x}"),
+    }
+}
+
+pub fn write_orchestrator_msg(w: &mut impl Write, msg: &OrchestratorMsg) -> Result<()> {
+    match msg {
+        OrchestratorMsg::TranscribedText(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0xA0])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
+        OrchestratorMsg::ResponseText(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0xA1])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
+        OrchestratorMsg::SessionStart(json) => {
+            let payload = json.as_bytes();
+            w.write_all(&[0xA2])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
+        OrchestratorMsg::SessionEnd => {
+            w.write_all(&[0xA3])?;
+            w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+    }
+    Ok(())
+}
+
+pub fn read_orchestrator_msg(r: &mut impl Read) -> Result<OrchestratorMsg> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    match tag[0] {
+        0xA0 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(OrchestratorMsg::TranscribedText(String::from_utf8(
+                payload,
+            )?))
+        }
+        0xA1 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(OrchestratorMsg::ResponseText(String::from_utf8(payload)?))
+        }
+        0xA2 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(OrchestratorMsg::SessionStart(String::from_utf8(payload)?))
+        }
+        0xA3 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(OrchestratorMsg::SessionEnd)
+        }
+        other => bail!("Unknown orchestrator message tag: 0x{other:02x}"),
     }
 }
 
@@ -128,6 +269,7 @@ mod tests {
         let msg = read_client_msg(&mut cursor).unwrap();
         match msg {
             ClientMsg::AudioSegment(decoded) => assert_eq!(decoded, samples),
+            other => panic!("Expected AudioSegment, got {other:?}"),
         }
     }
 
@@ -141,6 +283,7 @@ mod tests {
         let msg = read_client_msg(&mut cursor).unwrap();
         match msg {
             ClientMsg::AudioSegment(decoded) => assert_eq!(decoded, samples),
+            other => panic!("Expected AudioSegment, got {other:?}"),
         }
     }
 
@@ -229,5 +372,233 @@ mod tests {
         let buf = vec![0xFF, 0, 0, 0, 0];
         let mut cursor = Cursor::new(buf);
         assert!(read_server_msg(&mut cursor).is_err());
+    }
+
+    // --- Task 1: PauseRequest + ResumeRequest ---
+
+    #[test]
+    fn round_trip_pause_request() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::PauseRequest).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ClientMsg::PauseRequest));
+    }
+
+    #[test]
+    fn round_trip_resume_request() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::ResumeRequest).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ClientMsg::ResumeRequest));
+    }
+
+    // --- Task 2: TtsAudioChunk + TtsEnd ---
+
+    #[test]
+    fn round_trip_tts_audio_chunk() {
+        let samples: Vec<i16> = vec![-32768, -1, 0, 1, 32767];
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::TtsAudioChunk(samples.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        match msg {
+            ServerMsg::TtsAudioChunk(decoded) => assert_eq!(decoded, samples),
+            other => panic!("Expected TtsAudioChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_tts_audio_chunk_empty() {
+        let samples: Vec<i16> = vec![];
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::TtsAudioChunk(samples.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        match msg {
+            ServerMsg::TtsAudioChunk(decoded) => assert_eq!(decoded, samples),
+            other => panic!("Expected TtsAudioChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_tts_end() {
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::TtsEnd).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ServerMsg::TtsEnd));
+    }
+
+    // --- Task 3: OrchestratorMsg ---
+
+    #[test]
+    fn round_trip_transcribed_text() {
+        let text = "Hello, how are you today?".to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::TranscribedText(text.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::TranscribedText(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_response_text() {
+        let text = "I'm doing well! Let's practice some English.".to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::ResponseText(text.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::ResponseText(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected ResponseText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_session_start() {
+        let json =
+            r#"{"agent_path": "/path/to/agent.md", "session_dir": "/tmp/session"}"#.to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SessionStart(json.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::SessionStart(decoded) => assert_eq!(decoded, json),
+            other => panic!("Expected SessionStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_session_end() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SessionEnd).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, OrchestratorMsg::SessionEnd));
+    }
+
+    #[test]
+    fn round_trip_transcribed_text_empty() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::TranscribedText(String::new())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::TranscribedText(decoded) => assert_eq!(decoded, ""),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_session_start_empty() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SessionStart(String::new())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::SessionStart(decoded) => assert_eq!(decoded, ""),
+            other => panic!("Expected SessionStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_orchestrator_tag_errors() {
+        let buf = vec![0xFF, 0, 0, 0, 0];
+        let mut cursor = Cursor::new(buf);
+        assert!(read_orchestrator_msg(&mut cursor).is_err());
+    }
+
+    // --- Task 4: Multi-message stream tests ---
+
+    #[test]
+    fn multiple_client_messages_in_stream() {
+        let samples: Vec<i16> = vec![100, -100];
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::AudioSegment(samples.clone())).unwrap();
+        write_client_msg(&mut buf, &ClientMsg::PauseRequest).unwrap();
+        write_client_msg(&mut buf, &ClientMsg::ResumeRequest).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        match read_client_msg(&mut cursor).unwrap() {
+            ClientMsg::AudioSegment(decoded) => assert_eq!(decoded, samples),
+            other => panic!("Expected AudioSegment, got {other:?}"),
+        }
+        assert!(matches!(
+            read_client_msg(&mut cursor).unwrap(),
+            ClientMsg::PauseRequest
+        ));
+        assert!(matches!(
+            read_client_msg(&mut cursor).unwrap(),
+            ClientMsg::ResumeRequest
+        ));
+    }
+
+    #[test]
+    fn multiple_server_messages_with_tts_in_stream() {
+        let samples: Vec<i16> = vec![1000, -1000, 500];
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::Ready).unwrap();
+        write_server_msg(&mut buf, &ServerMsg::TtsAudioChunk(samples.clone())).unwrap();
+        write_server_msg(&mut buf, &ServerMsg::TtsEnd).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        assert!(matches!(
+            read_server_msg(&mut cursor).unwrap(),
+            ServerMsg::Ready
+        ));
+        match read_server_msg(&mut cursor).unwrap() {
+            ServerMsg::TtsAudioChunk(decoded) => assert_eq!(decoded, samples),
+            other => panic!("Expected TtsAudioChunk, got {other:?}"),
+        }
+        assert!(matches!(
+            read_server_msg(&mut cursor).unwrap(),
+            ServerMsg::TtsEnd
+        ));
+    }
+
+    #[test]
+    fn multiple_orchestrator_messages_in_stream() {
+        let json = r#"{"agent_path": "agent.md"}"#.to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SessionStart(json.clone())).unwrap();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::TranscribedText("hello".into()))
+            .unwrap();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::ResponseText("hi there".into()))
+            .unwrap();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SessionEnd).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        match read_orchestrator_msg(&mut cursor).unwrap() {
+            OrchestratorMsg::SessionStart(decoded) => assert_eq!(decoded, json),
+            other => panic!("Expected SessionStart, got {other:?}"),
+        }
+        match read_orchestrator_msg(&mut cursor).unwrap() {
+            OrchestratorMsg::TranscribedText(t) => assert_eq!(t, "hello"),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+        match read_orchestrator_msg(&mut cursor).unwrap() {
+            OrchestratorMsg::ResponseText(t) => assert_eq!(t, "hi there"),
+            other => panic!("Expected ResponseText, got {other:?}"),
+        }
+        assert!(matches!(
+            read_orchestrator_msg(&mut cursor).unwrap(),
+            OrchestratorMsg::SessionEnd
+        ));
     }
 }

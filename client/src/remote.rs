@@ -77,6 +77,8 @@ impl Transcriber for RemoteTranscriber {
             ServerMsg::Text(text) => Ok(text),
             ServerMsg::Error(e) => bail!("Remote transcription error: {e}"),
             ServerMsg::Ready => bail!("Unexpected Ready message during transcription"),
+            ServerMsg::TtsAudioChunk(_) => bail!("Unexpected TtsAudioChunk during transcription"),
+            ServerMsg::TtsEnd => bail!("Unexpected TtsEnd during transcription"),
         }
     }
 }
