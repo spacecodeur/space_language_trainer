@@ -5,9 +5,13 @@ edition = "2024"
 
 [features]
 default = []
-cuda = ["whisper-rs/cuda"]
+cuda = ["whisper-rs/cuda", "sherpa-rs/cuda"]
 
 [dependencies]
 space_lt_common = { path = "../common" }
 whisper-rs = "0.15.1"
 anyhow = "1.0.101"
+rubato = "1.0.1"
+audioadapter-buffers = "2.0.0"
+hound = "3.5.1"
+sherpa-rs = "0.6.8"
