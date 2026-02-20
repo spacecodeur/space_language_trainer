@@ -43,7 +43,7 @@ development_status:
   # Epic 1: Project Foundation & Feasibility Validation
   epic-1: in-progress
   1-1-fork-workspace-and-set-up-project-structure: done
-  1-2-validate-claude-cli-session-continuity: backlog
+  1-2-validate-claude-cli-session-continuity: done
   1-3-extend-binary-protocol-with-new-message-types: backlog
   epic-1-retrospective: optional
 
