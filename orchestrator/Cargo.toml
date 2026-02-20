@@ -1,0 +1,8 @@
+[package]
+name = "space_lt_orchestrator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+space_lt_common = { path = "../common" }
+anyhow = "1.0.101"

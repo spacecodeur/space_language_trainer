@@ -1,0 +1,78 @@
+# generated: 2026-02-20
+# project: space_language_training
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: /home/okli/code/space_language_training/_bmad-output/implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog -> in-progress: Automatically when first story is created (via create-story)
+#   - in-progress -> done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - SM typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: 2026-02-20
+project: space_language_training
+project_key: NOKEY
+tracking_system: file-system
+story_location: /home/okli/code/space_language_training/_bmad-output/implementation-artifacts
+
+development_status:
+  # Epic 1: Project Foundation & Feasibility Validation
+  epic-1: in-progress
+  1-1-fork-workspace-and-set-up-project-structure: done
+  1-2-validate-claude-cli-session-continuity: backlog
+  1-3-extend-binary-protocol-with-new-message-types: backlog
+  epic-1-retrospective: optional
+
+  # Epic 2: End-to-End Voice Conversation
+  epic-2: backlog
+  2-1-orchestrator-claude-cli-bridge: backlog
+  2-2-tts-engine-integration: backlog
+  2-3-server-dual-listeners-and-message-routing: backlog
+  2-4-client-tcp-connection-and-audio-playback: backlog
+  2-5-voice-loop-and-end-to-end-integration: backlog
+  epic-2-retrospective: optional
+
+  # Epic 3: Session Control & Robustness
+  epic-3: backlog
+  3-1-hotkey-pause-resume: backlog
+  3-2-hotkey-configuration-and-session-end: backlog
+  3-3-claude-cli-retry-and-audio-error-recovery: backlog
+  epic-3-retrospective: optional
+
+  # Epic 4: Intelligent Language Coaching
+  epic-4: backlog
+  4-1-core-language-coaching-persona-and-real-time-feedback: backlog
+  4-2-deferred-feedback-and-scenario-handling: backlog
+  4-3-initial-level-assessment-and-focus-suggestions: backlog
+  epic-4-retrospective: optional
+
+  # Epic 5: Cross-Session Progress Tracking
+  epic-5: backlog
+  5-1-session-context-loading: backlog
+  5-2-session-synthesis-and-tracking-file-generation: backlog
+  5-3-meta-tracking-weak-points-and-vocabulary-maintenance: backlog
+  epic-5-retrospective: optional
