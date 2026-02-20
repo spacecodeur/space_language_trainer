@@ -1,10 +1,13 @@
+mod listener;
 mod server;
+mod session;
 mod transcribe;
 mod tts;
 
 use anyhow::Result;
 
-use space_lt_common::info;
+use space_lt_common::{debug, info};
+use transcribe::Transcriber;
 use tts::TtsEngine;
 
 fn find_arg_value(args: &[String], flag: &str) -> Option<String> {
@@ -28,7 +31,6 @@ fn main() -> Result<()> {
         let models_dir = space_lt_common::models::default_models_dir();
         let models = space_lt_common::models::scan_models(&models_dir)?;
         if std::io::stdout().is_terminal() {
-            // Interactive: human-friendly output
             if models.is_empty() {
                 println!("No models found in {}", models_dir.display());
             } else {
@@ -38,7 +40,6 @@ fn main() -> Result<()> {
                 }
             }
         } else {
-            // Piped (e.g. SSH): machine-parseable name\tpath
             for (name, path) in &models {
                 println!("{name}\t{}", path.display());
             }
@@ -73,22 +74,56 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Default: run as server (requires --model)
-    let model_arg = find_arg_value(&args, "--model")
-        .ok_or_else(|| anyhow::anyhow!("Usage: space_lt_server --model <name> --language <lang>\n       space_lt_server --list-models"))?;
+    // Default: run as daemon server (requires --model and --tts-model)
+    let model_arg = find_arg_value(&args, "--model").ok_or_else(|| {
+        anyhow::anyhow!(
+            "Usage: space_lt_server --model <name> --tts-model <path> [--port <port>] [--socket-path <path>]\n       space_lt_server --list-models\n       space_lt_server --tts-test \"text\" --tts-model <path>"
+        )
+    })?;
     let model = space_lt_common::models::resolve_model_path(&model_arg);
     let language = find_arg_value(&args, "--language").unwrap_or_else(|| "en".to_string());
 
-    // Load TTS model if --tts-model provided (stays resident for story 2-3 to wire in)
-    // Note: loads before Whisper due to current code structure; G4 order will be
-    // enforced when server::run() is refactored in story 2-3
-    let _tts = if let Some(tts_model_dir) = find_arg_value(&args, "--tts-model") {
-        let engine = tts::KokoroTts::new(std::path::Path::new(&tts_model_dir))?;
-        info!("[server] TTS model loaded (not yet wired into message loop)");
-        Some(engine)
-    } else {
-        None
-    };
+    let tts_model_dir = find_arg_value(&args, "--tts-model").ok_or_else(|| {
+        anyhow::anyhow!("Daemon mode requires --tts-model <path> (Kokoro model directory)")
+    })?;
 
-    server::run(&model.to_string_lossy(), &language)
+    let port: u16 = find_arg_value(&args, "--port")
+        .map(|p| p.parse())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Invalid --port value: {e}"))?
+        .unwrap_or(9500);
+
+    let socket_path = find_arg_value(&args, "--socket-path")
+        .unwrap_or_else(|| "/tmp/space_lt_server.sock".to_string());
+
+    // Sequential model loading (G4): Whisper first, then Kokoro
+    info!("[server] Loading Whisper model: {model_arg}...");
+    let start = std::time::Instant::now();
+    let mut transcriber = transcribe::LocalTranscriber::new(&model.to_string_lossy(), &language)?;
+    info!(
+        "[server] Whisper model loaded in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
+
+    // Warm up Whisper (GPU graph init)
+    debug!("[server] Warming up Whisper...");
+    let silence = vec![0i16; 16000];
+    let _ = transcriber.transcribe(&silence);
+    debug!("[server] Whisper warm-up complete");
+
+    info!("[server] Loading TTS model: {tts_model_dir}...");
+    let start = std::time::Instant::now();
+    let tts_engine = tts::KokoroTts::new(std::path::Path::new(&tts_model_dir))?;
+    info!(
+        "[server] TTS model loaded in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
+
+    // Run daemon
+    server::run_daemon(
+        Box::new(transcriber),
+        Box::new(tts_engine),
+        port,
+        std::path::Path::new(&socket_path),
+    )
 }

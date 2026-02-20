@@ -1,77 +1,60 @@
-use anyhow::Result;
-use std::io::{BufReader, BufWriter, Write};
+use anyhow::{Context, Result};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
-use space_lt_common::protocol::{ClientMsg, ServerMsg, read_client_msg, write_server_msg};
-use space_lt_common::{debug, info};
+use space_lt_common::info;
+use space_lt_common::protocol::{ServerMsg, write_server_msg};
 
-use crate::transcribe::{LocalTranscriber, Transcriber};
+use crate::listener;
+use crate::session;
+use crate::transcribe::Transcriber;
+use crate::tts::TtsEngine;
 
-pub fn run(model_path: &str, language: &str) -> Result<()> {
-    info!("Server mode: loading model {model_path}...");
+/// Run the server in daemon mode: TCP listener for client + Unix socket for orchestrator.
+///
+/// Models must already be loaded and passed as trait objects.
+pub fn run_daemon(
+    transcriber: Box<dyn Transcriber>,
+    tts: Box<dyn TtsEngine>,
+    port: u16,
+    socket_path: &Path,
+) -> Result<()> {
+    // Start listeners
+    let tcp_listener = listener::start_tcp(port)?;
+    let unix_listener = listener::start_unix(socket_path)?;
 
-    let mut transcriber = LocalTranscriber::new(model_path, language)?;
+    info!("[server] Waiting for client connection on port {port}...");
+    let (tcp_stream, client_addr) = tcp_listener
+        .accept()
+        .context("accepting TCP client connection")?;
+    info!("[server] Client connected from {client_addr}");
 
-    // Warm-up: transcribe 1s of silence to init GPU graph
-    debug!("Warming up whisper...");
-    let silence = vec![0i16; 16000];
-    let _ = transcriber.transcribe(&silence);
-    debug!("Warm-up complete.");
+    // Send Ready to client
+    let mut client_writer = BufWriter::new(
+        tcp_stream
+            .try_clone()
+            .context("cloning TCP stream for Ready")?,
+    );
+    write_server_msg(&mut client_writer, &ServerMsg::Ready)?;
+    client_writer.flush()?;
 
-    // Send Ready on stdout
-    let stdout = std::io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-    write_server_msg(&mut writer, &ServerMsg::Ready)?;
-    writer.flush()?;
+    info!(
+        "[server] Waiting for orchestrator connection on {}...",
+        socket_path.display()
+    );
+    let (unix_stream, _) = unix_listener
+        .accept()
+        .context("accepting Unix socket orchestrator connection")?;
+    info!("[server] Orchestrator connected");
 
-    info!("Server ready, waiting for audio segments...");
+    info!("[server] Starting session routing...");
+    session::run_session(transcriber, tts, tcp_stream, unix_stream)?;
 
-    // Read from stdin
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-
-    loop {
-        let msg = match read_client_msg(&mut reader) {
-            Ok(msg) => msg,
-            Err(e) => {
-                // EOF or broken pipe = client disconnected
-                let msg = format!("{e}");
-                if msg.contains("unexpected end of file")
-                    || msg.contains("UnexpectedEof")
-                    || msg.contains("broken pipe")
-                {
-                    info!("Client disconnected, shutting down.");
-                    break;
-                }
-                info!("Protocol error: {e}");
-                break;
-            }
-        };
-
-        match msg {
-            ClientMsg::AudioSegment(samples) => {
-                debug!(
-                    "Received audio segment: {} samples ({:.0}ms)",
-                    samples.len(),
-                    samples.len() as f64 / 16.0
-                );
-
-                let response = match transcriber.transcribe(&samples) {
-                    Ok(text) => ServerMsg::Text(text),
-                    Err(e) => ServerMsg::Error(format!("{e}")),
-                };
-
-                write_server_msg(&mut writer, &response)?;
-                writer.flush()?;
-            }
-            ClientMsg::PauseRequest => {
-                debug!("Received PauseRequest (not yet implemented)");
-            }
-            ClientMsg::ResumeRequest => {
-                debug!("Received ResumeRequest (not yet implemented)");
-            }
-        }
+    // Clean up Unix socket file
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path).ok();
     }
 
-    info!("Server shutdown complete.");
+    info!("[server] Server shutdown complete");
     Ok(())
 }
