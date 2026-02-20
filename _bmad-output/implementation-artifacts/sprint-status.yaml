@@ -52,7 +52,7 @@ development_status:
   2-1-orchestrator-claude-cli-bridge: done
   2-2-tts-engine-integration: done
   2-3-server-dual-listeners-and-message-routing: done
-  2-4-client-tcp-connection-and-audio-playback: backlog
+  2-4-client-tcp-connection-and-audio-playback: done
   2-5-voice-loop-and-end-to-end-integration: backlog
   epic-2-retrospective: optional
 

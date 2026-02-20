@@ -7,21 +7,15 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use std::time::Duration;
 
-use crate::inject;
-use crate::remote;
-
 pub struct SetupConfig {
-    pub ssh_target: String,
-    pub remote_model_path: String,
+    pub server_addr: String,
     pub device: cpal::Device,
     pub device_name: String,
     pub hotkey: EvdevKeyCode,
-    pub language: String,
-    pub xkb_layout: String,
 }
 
 pub fn run_setup() -> Result<SetupConfig> {
-    // Auto-detect default audio input device (routes through PipeWire on modern Linux)
+    // Auto-detect default audio input device
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -33,8 +27,8 @@ pub fn run_setup() -> Result<SetupConfig> {
 
     let mut terminal = ratatui::init();
 
-    // Screen 1: SSH target input
-    let ssh_target = match text_input_screen(&mut terminal, "SSH Target", "user@host") {
+    // Screen 1: Server address input
+    let server_addr = match text_input_screen(&mut terminal, "Server Address", "127.0.0.1:9500") {
         Ok(t) => t,
         Err(e) => {
             ratatui::restore();
@@ -42,55 +36,7 @@ pub fn run_setup() -> Result<SetupConfig> {
         }
     };
 
-    // Screen 2: Discover remote models (temporarily restore terminal for SSH output)
-    ratatui::restore();
-    let models = remote::list_remote_models(&ssh_target)?;
-    if models.is_empty() {
-        bail!("No Whisper models found on remote machine {ssh_target}.");
-    }
-    terminal = ratatui::init();
-
-    let model_labels: Vec<String> = models.iter().map(|(name, _)| name.clone()).collect();
-    let model_idx = match select_screen(&mut terminal, "Select Remote Model", &model_labels) {
-        Ok(idx) => idx,
-        Err(e) => {
-            ratatui::restore();
-            return Err(e);
-        }
-    };
-    let remote_model_path = models[model_idx].1.clone();
-
-    // Screen 3: Language selection
-    let language_choices = vec![
-        "English".to_string(),
-        "Français".to_string(),
-        "Deutsch".to_string(),
-        "Español".to_string(),
-        "Italiano".to_string(),
-        "Português".to_string(),
-        "日本語".to_string(),
-        "中文".to_string(),
-    ];
-    let language_idx = match select_screen(&mut terminal, "Select Language", &language_choices) {
-        Ok(idx) => idx,
-        Err(e) => {
-            ratatui::restore();
-            return Err(e);
-        }
-    };
-    let language = match language_idx {
-        0 => "en",
-        1 => "fr",
-        2 => "de",
-        3 => "es",
-        4 => "it",
-        5 => "pt",
-        6 => "ja",
-        7 => "zh",
-        _ => "en",
-    };
-
-    // Screen 4: Push-to-Talk Key selection
+    // Screen 2: Push-to-Talk Key selection
     let hotkey_choices = vec![
         "F2".to_string(),
         "F3".to_string(),
@@ -127,13 +73,10 @@ pub fn run_setup() -> Result<SetupConfig> {
     };
 
     Ok(SetupConfig {
-        ssh_target,
-        remote_model_path,
+        server_addr,
         device,
         device_name,
         hotkey,
-        language: language.to_string(),
-        xkb_layout: inject::detect_xkb_layout(),
     })
 }
 
@@ -177,8 +120,9 @@ fn text_input_screen(
                 }
                 KeyCode::Enter => {
                     let trimmed = input.trim().to_string();
+                    // If empty, use placeholder as default
                     if trimmed.is_empty() {
-                        continue;
+                        return Ok(placeholder.to_string());
                     }
                     return Ok(trimmed);
                 }

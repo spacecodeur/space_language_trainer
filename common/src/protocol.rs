@@ -1,5 +1,19 @@
 use anyhow::{Result, bail};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+
+/// Check if an error indicates a peer disconnection (EOF, broken pipe, or reset).
+///
+/// Shared by both client and server for consistent disconnect detection.
+pub fn is_disconnect(e: &anyhow::Error) -> bool {
+    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+        matches!(
+            io_err.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        )
+    } else {
+        false
+    }
+}
 
 // --- Client messages (client → server, tags 0x01-0x7F) ---
 
@@ -600,5 +614,37 @@ mod tests {
             read_orchestrator_msg(&mut cursor).unwrap(),
             OrchestratorMsg::SessionEnd
         ));
+    }
+
+    // --- is_disconnect tests ---
+
+    #[test]
+    fn is_disconnect_detects_unexpected_eof() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "connection closed",
+        ));
+        assert!(super::is_disconnect(&err));
+    }
+
+    #[test]
+    fn is_disconnect_detects_broken_pipe() {
+        let err = anyhow::Error::new(std::io::Error::new(ErrorKind::BrokenPipe, "pipe broke"));
+        assert!(super::is_disconnect(&err));
+    }
+
+    #[test]
+    fn is_disconnect_detects_connection_reset() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            ErrorKind::ConnectionReset,
+            "peer reset",
+        ));
+        assert!(super::is_disconnect(&err));
+    }
+
+    #[test]
+    fn is_disconnect_ignores_other_errors() {
+        let err = anyhow::anyhow!("some other error");
+        assert!(!super::is_disconnect(&err));
     }
 }

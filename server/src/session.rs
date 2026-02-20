@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use std::io::{BufReader, BufWriter, ErrorKind, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use space_lt_common::protocol::{
-    ClientMsg, OrchestratorMsg, ServerMsg, read_client_msg, read_orchestrator_msg,
+    ClientMsg, OrchestratorMsg, ServerMsg, is_disconnect, read_client_msg, read_orchestrator_msg,
     write_orchestrator_msg, write_server_msg,
 };
 use space_lt_common::{debug, info, warn};
@@ -15,18 +15,6 @@ use crate::tts::TtsEngine;
 
 /// Number of i16 samples per TtsAudioChunk (250ms at 16kHz).
 const TTS_CHUNK_SIZE: usize = 4000;
-
-/// Check if an error indicates a peer disconnection (EOF or broken pipe).
-fn is_disconnect(e: &anyhow::Error) -> bool {
-    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-        matches!(
-            io_err.kind(),
-            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-        )
-    } else {
-        false
-    }
-}
 
 /// Run the message routing session between a TCP client and a Unix socket orchestrator.
 ///
