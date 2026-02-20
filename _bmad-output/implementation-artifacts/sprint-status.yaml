@@ -48,8 +48,8 @@ development_status:
   epic-1-retrospective: optional
 
   # Epic 2: End-to-End Voice Conversation
-  epic-2: backlog
-  2-1-orchestrator-claude-cli-bridge: backlog
+  epic-2: in-progress
+  2-1-orchestrator-claude-cli-bridge: done
   2-2-tts-engine-integration: backlog
   2-3-server-dual-listeners-and-message-routing: backlog
   2-4-client-tcp-connection-and-audio-playback: backlog
