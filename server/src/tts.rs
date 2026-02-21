@@ -27,7 +27,7 @@ impl KokoroTts {
     /// - espeak-ng-data/ — phoneme data
     /// - dict/ — dictionary data
     /// - lexicon-us-en.txt — English lexicon
-    pub fn new(model_dir: &Path) -> Result<Self> {
+    pub fn new(model_dir: &Path, lang: &str) -> Result<Self> {
         let model_dir_str = model_dir
             .to_str()
             .context("model directory path is not valid UTF-8")?;
@@ -60,6 +60,7 @@ impl KokoroTts {
             dict_dir: format!("{model_dir_str}/dict"),
             lexicon,
             length_scale: 1.0,
+            lang: lang.to_string(),
             ..Default::default()
         };
 

@@ -51,7 +51,8 @@ fn main() -> Result<()> {
     if let Some(test_text) = find_arg_value(&args, "--tts-test") {
         let tts_model_dir = find_arg_value(&args, "--tts-model")
             .ok_or_else(|| anyhow::anyhow!("--tts-test requires --tts-model <path>"))?;
-        let tts = tts::KokoroTts::new(std::path::Path::new(&tts_model_dir))?;
+        let tts_lang = find_arg_value(&args, "--language").unwrap_or_else(|| "en".to_string());
+        let tts = tts::KokoroTts::new(std::path::Path::new(&tts_model_dir), &tts_lang)?;
         let samples = tts.synthesize(&test_text)?;
         info!(
             "[server] Synthesized {} samples ({:.2}s at 16kHz)",
@@ -113,7 +114,7 @@ fn main() -> Result<()> {
 
     info!("[server] Loading TTS model: {tts_model_dir}...");
     let start = std::time::Instant::now();
-    let tts_engine = tts::KokoroTts::new(std::path::Path::new(&tts_model_dir))?;
+    let tts_engine = tts::KokoroTts::new(std::path::Path::new(&tts_model_dir), &language)?;
     info!(
         "[server] TTS model loaded in {:.1}s",
         start.elapsed().as_secs_f64()
