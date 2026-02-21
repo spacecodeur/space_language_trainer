@@ -102,6 +102,9 @@ const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Predefined error message sent to user via TTS when all retries fail.
 const ERROR_FALLBACK: &str =
     "I'm sorry, I'm having trouble connecting right now. Please try again in a moment.";
+/// Tools to enable for Claude CLI invocations.
+/// WebSearch allows topic-based discussions with current information (FR12).
+const ALLOWED_TOOLS: &str = "WebSearch";
 
 impl ClaudeCliBackend {
     pub fn new(session_dir: std::path::PathBuf) -> Self {
@@ -135,7 +138,7 @@ impl ClaudeCliBackend {
             cmd.args(["--system-prompt", &system_prompt]);
         }
 
-        cmd.args(["--output-format", "text", "--tools", ""]);
+        cmd.args(["--output-format", "text", "--tools", ALLOWED_TOOLS]);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -295,5 +298,17 @@ mod tests {
 
         let result = backend.query("1", &p, false).unwrap();
         assert_eq!(result, "OK");
+    }
+
+    #[test]
+    fn allowed_tools_enables_web_search() {
+        assert!(
+            ALLOWED_TOOLS.contains("WebSearch"),
+            "ALLOWED_TOOLS must include WebSearch for topic discussions (FR12)"
+        );
+        assert!(
+            !ALLOWED_TOOLS.is_empty(),
+            "ALLOWED_TOOLS must not be empty (empty string disables all tools)"
+        );
     }
 }
