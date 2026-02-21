@@ -186,15 +186,23 @@ fn tts_router(
                 }
 
                 debug!("[server] ResponseText: {} chars", text.len());
+                let tts_start = std::time::Instant::now();
 
                 match tts.synthesize(&text) {
                     Ok(samples) => {
-                        debug!(
-                            "[server] TTS: {} samples ({:.2}s)",
-                            samples.len(),
-                            samples.len() as f64 / 16000.0
+                        let synth_elapsed = tts_start.elapsed();
+                        let audio_duration = samples.len() as f64 / 16000.0;
+                        info!(
+                            "[server] TTS synthesis: {:.2}s for {:.2}s of audio ({} chars)",
+                            synth_elapsed.as_secs_f64(),
+                            audio_duration,
+                            text.len()
                         );
                         send_tts_audio(&mut writer, &samples)?;
+                        info!(
+                            "[server] TTS total (synthesis + send): {:.2}s",
+                            tts_start.elapsed().as_secs_f64()
+                        );
                     }
                     Err(e) => {
                         warn!("[server] TTS synthesis failed: {e}");

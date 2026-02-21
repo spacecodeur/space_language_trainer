@@ -68,6 +68,27 @@ impl Transcriber for LocalTranscriber {
     }
 }
 
+/// Check if text is entirely composed of repeated known hallucination patterns.
+/// Catches "Hello, this is an English transcription. Hello, this is an English transcription"
+/// and similar multi-repeat variants.
+fn is_repeated_hallucination(text: &str, patterns: &[&str]) -> bool {
+    // Split on sentence boundaries and check if every part matches a known pattern
+    let parts: Vec<&str> = text
+        .split(['.', '!', '?'])
+        .map(|s| s.trim().trim_end_matches([',', ' ']))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if parts.len() < 2 {
+        return false;
+    }
+
+    parts.iter().all(|part| {
+        let lower = part.to_lowercase();
+        patterns.iter().any(|p| lower == *p)
+    })
+}
+
 /// Filter out common Whisper hallucinations (YouTube subtitle artifacts).
 /// Returns empty string if the entire text is a hallucination.
 fn filter_hallucinations(text: &str) -> String {
@@ -93,6 +114,16 @@ fn filter_hallucinations(text: &str) -> String {
         "société radio-canada",
         "subscribe",
         "merci",
+        "thank you",
+        "thanks",
+        "you",
+        // Initial prompt echoes — Whisper hallucinates these back on silence/noise
+        "hello, this is an english transcription",
+        "bonjour, ceci est une transcription en français",
+        "hallo, dies ist eine transkription auf deutsch",
+        "hola, esta es una transcripción en español",
+        "ciao, questa è una trascrizione in italiano",
+        "olá, esta é uma transcrição em português",
     ];
 
     if is_repetitive(&text.to_lowercase()) {
@@ -110,6 +141,12 @@ fn filter_hallucinations(text: &str) -> String {
         if stripped == *pattern {
             return String::new();
         }
+    }
+
+    // Repeated hallucination check: "X. X" or "X. X. X" where X is a known pattern.
+    // Whisper often repeats the same hallucination 2+ times with punctuation separators.
+    if is_repeated_hallucination(stripped, FULLMATCH_HALLUCINATIONS) {
+        return String::new();
     }
 
     // Trailing match: only long specific patterns
@@ -248,6 +285,53 @@ mod tests {
         );
         assert_eq!(filter_hallucinations("Sous-titrage"), "");
         assert_eq!(filter_hallucinations("Subscribe"), "");
+        // Single "Thank you" / "Thanks" — very common Whisper hallucination
+        assert_eq!(filter_hallucinations("Thank you"), "");
+        assert_eq!(filter_hallucinations("Thank you."), "");
+        assert_eq!(filter_hallucinations("Thanks"), "");
+        assert_eq!(filter_hallucinations("You"), "");
+    }
+
+    #[test]
+    fn filter_repeated_hallucination() {
+        // Same hallucination repeated 2+ times with punctuation
+        assert_eq!(
+            filter_hallucinations(
+                "Hello, this is an English transcription. Hello, this is an English transcription"
+            ),
+            ""
+        );
+        assert_eq!(filter_hallucinations("Thank you. Thank you"), "");
+        assert_eq!(
+            filter_hallucinations("Thank you! Thank you! Thank you!"),
+            ""
+        );
+        // Mixed hallucination patterns
+        assert_eq!(
+            filter_hallucinations("Thank you. Hello, this is an English transcription"),
+            ""
+        );
+    }
+
+    #[test]
+    fn filter_initial_prompt_echo() {
+        // Whisper echoes back the initial_prompt on silence/noise
+        assert_eq!(
+            filter_hallucinations("Hello, this is an English transcription."),
+            ""
+        );
+        assert_eq!(
+            filter_hallucinations("Hello, this is an English transcription"),
+            ""
+        );
+        assert_eq!(
+            filter_hallucinations("Bonjour, ceci est une transcription en français."),
+            ""
+        );
+        assert_eq!(
+            filter_hallucinations("Hallo, dies ist eine Transkription auf Deutsch."),
+            ""
+        );
     }
 
     #[test]
@@ -304,6 +388,11 @@ mod tests {
         assert_eq!(
             filter_hallucinations("I need to subscribe to the service"),
             "I need to subscribe to the service"
+        );
+        // "thank you" within a real sentence should be kept
+        assert_eq!(
+            filter_hallucinations("I want to thank you for your help"),
+            "I want to thank you for your help"
         );
     }
 }

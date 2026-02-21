@@ -52,6 +52,15 @@ impl KokoroTts {
         // Build lexicon: include all lexicon-*.txt files found in the directory
         let lexicon = build_lexicon_path(model_dir);
 
+        let provider = if cfg!(feature = "cuda") {
+            "cuda"
+        } else {
+            "cpu"
+        };
+        let num_threads = 8;
+
+        debug!("[server] TTS provider: {provider}, threads: {num_threads}");
+
         let config = sherpa_rs::tts::KokoroTtsConfig {
             model: format!("{model_dir_str}/model.onnx"),
             voices: format!("{model_dir_str}/voices.bin"),
@@ -65,6 +74,11 @@ impl KokoroTts {
             lexicon,
             length_scale: 1.0,
             lang: lang.to_string(),
+            onnx_config: sherpa_rs::OnnxConfig {
+                provider: provider.to_string(),
+                num_threads,
+                debug: false,
+            },
             ..Default::default()
         };
 
@@ -94,7 +108,7 @@ impl TtsEngine for KokoroTts {
             .map_err(|e| anyhow::anyhow!("TTS mutex poisoned: {e}"))?;
 
         let audio = tts
-            .create(text, self.speaker_id, 1.0)
+            .create(text, self.speaker_id, 0.8)
             .map_err(|e| anyhow::anyhow!("TTS synthesis failed: {e}"))?;
 
         debug!(

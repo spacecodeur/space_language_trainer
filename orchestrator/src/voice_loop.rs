@@ -10,18 +10,10 @@ use space_lt_common::{info, warn};
 
 use crate::claude::LlmBackend;
 
-/// Truncate a string to at most `max_bytes` without splitting a UTF-8 character.
-fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    // Find the last char boundary at or before max_bytes
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+/// Short reminder prepended to every user prompt to reinforce voice output rules.
+/// On --continue turns, Claude may "forget" the system prompt's formatting rules,
+/// especially when using web search. This inline reminder keeps it on track.
+const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max.]\n\n";
 
 /// Voice loop state (for logging).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,12 +74,12 @@ pub fn run_voice_loop(
         info!("[orchestrator] State: {prev_state} → {state}");
 
         turn_count += 1;
-        info!(
-            "[orchestrator] Turn {turn_count}: received '{}'",
-            truncate_utf8(&text, 80)
-        );
+        info!("[orchestrator] Turn {turn_count}: received '{text}'");
 
-        let response = match backend.query(&text, agent_path, turn_count > 1) {
+        let augmented_prompt = format!("{FORMAT_REMINDER}{text}");
+        let query_start = std::time::Instant::now();
+
+        let response = match backend.query(&augmented_prompt, agent_path, turn_count > 1) {
             Ok(r) => r,
             Err(e) => {
                 warn!("[orchestrator] LLM query failed unexpectedly: {e}");
@@ -108,12 +100,13 @@ pub fn run_voice_loop(
         // 3. Send response back to server for TTS
         let prev_state = state;
         state = VoiceLoopState::WaitingForTts;
+        info!(
+            "[orchestrator] LLM query: {:.2}s",
+            query_start.elapsed().as_secs_f64()
+        );
         info!("[orchestrator] State: {prev_state} → {state}");
 
-        info!(
-            "[orchestrator] Response: '{}'",
-            truncate_utf8(&response, 80)
-        );
+        info!("[orchestrator] Response: '{response}'");
         write_orchestrator_msg(writer, &OrchestratorMsg::ResponseText(response))?;
 
         // 4. Back to waiting

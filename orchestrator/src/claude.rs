@@ -138,7 +138,7 @@ impl ClaudeCliBackend {
             cmd.args(["--system-prompt", &system_prompt]);
         }
 
-        cmd.args(["--output-format", "text", "--tools", ALLOWED_TOOLS]);
+        cmd.args(["--output-format", "text", "--allowedTools", ALLOWED_TOOLS]);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
