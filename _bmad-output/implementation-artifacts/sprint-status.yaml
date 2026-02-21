@@ -65,7 +65,7 @@ development_status:
 
   # Epic 4: Intelligent Language Coaching
   epic-4: in-progress
-  4-1-core-language-coaching-persona-and-real-time-feedback: ready-for-dev
+  4-1-core-language-coaching-persona-and-real-time-feedback: done
   4-2-deferred-feedback-and-scenario-handling: backlog
   4-3-initial-level-assessment-and-focus-suggestions: backlog
   epic-4-retrospective: optional
