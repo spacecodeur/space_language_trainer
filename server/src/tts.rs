@@ -57,7 +57,11 @@ impl KokoroTts {
             voices: format!("{model_dir_str}/voices.bin"),
             tokens: format!("{model_dir_str}/tokens.txt"),
             data_dir: format!("{model_dir_str}/espeak-ng-data"),
-            dict_dir: format!("{model_dir_str}/dict"),
+            dict_dir: if model_dir.join("dict").is_dir() {
+                format!("{model_dir_str}/dict")
+            } else {
+                String::new()
+            },
             lexicon,
             length_scale: 1.0,
             lang: lang.to_string(),
