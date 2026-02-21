@@ -104,6 +104,7 @@ fn filter_hallucinations(text: &str) -> String {
         "please subscribe",
         "thanks for watching",
         "thank you for watching",
+        "you can see the video in the description",
     ];
 
     // Short/generic patterns — only discard if they are the ENTIRE output

@@ -73,8 +73,21 @@ impl VoiceDetector {
         segments
     }
 
+    /// Flush any accumulated audio, returning it as a segment without waiting
+    /// for the silence threshold. Used for push-to-talk mode (hotkey toggle-off)
+    /// and to avoid discarding in-progress audio on pause in auto mode.
+    pub fn flush(&mut self) -> Option<Vec<i16>> {
+        if self.audio_buffer.is_empty() {
+            return None;
+        }
+        self.is_speaking = false;
+        self.silence_frames = 0;
+        self.pre_roll_buffer.clear();
+        Some(std::mem::take(&mut self.audio_buffer))
+    }
+
     pub fn reset(&mut self) {
-        // Recreate Vad to clear its internal state (no reset API available)
+        // Recreate Vad instance to clear internal state (no reset API available)
         self.vad = Vad::new_with_rate_and_mode(SampleRate::Rate16kHz, VadMode::Aggressive);
         self.audio_buffer.clear();
         self.pre_roll_buffer.clear();
@@ -167,5 +180,39 @@ mod tests {
         }
 
         assert_eq!(total_segments.len(), 2, "Should emit 2 separate segments");
+    }
+
+    #[test]
+    fn flush_returns_accumulated_audio() {
+        let mut vd = VoiceDetector::new().unwrap();
+
+        // Feed voice to start accumulating (no silence → no auto-segment)
+        let segs = vd.process_samples(&make_voice(30));
+        assert!(segs.is_empty());
+        assert!(vd.is_speaking);
+
+        // Flush returns the accumulated buffer
+        let flushed = vd.flush();
+        assert!(flushed.is_some());
+        let segment = flushed.unwrap();
+        assert!(segment.len() >= FRAME_SIZE * 30);
+    }
+
+    #[test]
+    fn flush_empty_returns_none() {
+        let mut vd = VoiceDetector::new().unwrap();
+        assert!(vd.flush().is_none());
+    }
+
+    #[test]
+    fn flush_resets_speaking_state() {
+        let mut vd = VoiceDetector::new().unwrap();
+
+        vd.process_samples(&make_voice(20));
+        assert!(vd.is_speaking);
+
+        vd.flush();
+        assert!(!vd.is_speaking);
+        assert!(vd.audio_buffer.is_empty());
     }
 }

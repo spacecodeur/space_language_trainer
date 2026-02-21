@@ -61,6 +61,11 @@ pub fn run_session(
     let paused_stt = paused.clone();
     let paused_tts = paused;
 
+    // Shared TTS interrupt flag: stt_router sets on InterruptTts, tts_router checks between chunks
+    let tts_interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_stt = tts_interrupted.clone();
+    let interrupted_tts = tts_interrupted;
+
     let stt_handle = std::thread::Builder::new()
         .name("stt_router".into())
         .spawn(move || {
@@ -70,12 +75,21 @@ pub fn run_session(
                 transcriber,
                 paused_stt,
                 client_writer_stt,
+                interrupted_stt,
             )
         })?;
 
     let tts_handle = std::thread::Builder::new()
         .name("tts_router".into())
-        .spawn(move || tts_router(unix_for_read, client_writer, tts, paused_tts))?;
+        .spawn(move || {
+            tts_router(
+                unix_for_read,
+                client_writer,
+                tts,
+                paused_tts,
+                interrupted_tts,
+            )
+        })?;
 
     // Wait for either thread to finish (connection close or error)
     loop {
@@ -112,6 +126,7 @@ fn stt_router(
     mut transcriber: Box<dyn Transcriber>,
     paused: Arc<AtomicBool>,
     client_writer: Arc<Mutex<BufWriter<TcpStream>>>,
+    tts_interrupted: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut reader = BufReader::new(tcp_read);
     let mut writer = BufWriter::new(unix_write);
@@ -165,6 +180,10 @@ fn stt_router(
                 paused.store(false, Ordering::SeqCst);
                 info!("[server] Session resumed");
             }
+            ClientMsg::InterruptTts => {
+                tts_interrupted.store(true, Ordering::SeqCst);
+                info!("[server] TTS interrupted by client");
+            }
         }
     }
 
@@ -177,6 +196,7 @@ fn tts_router(
     client_writer: Arc<Mutex<BufWriter<TcpStream>>>,
     tts: Box<dyn TtsEngine>,
     paused: Arc<AtomicBool>,
+    tts_interrupted: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut reader = BufReader::new(unix_read);
 
@@ -194,6 +214,8 @@ fn tts_router(
 
         match msg {
             OrchestratorMsg::ResponseText(text) => {
+                tts_interrupted.store(false, Ordering::SeqCst);
+
                 if paused.load(Ordering::SeqCst) {
                     debug!(
                         "[server] Paused — skipping TTS for response ({} chars)",
@@ -239,11 +261,18 @@ fn tts_router(
                         let mut w = client_writer
                             .lock()
                             .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
-                        send_tts_audio(&mut *w, &samples)?;
-                        info!(
-                            "[server] TTS total (synthesis + send): {:.2}s",
-                            tts_start.elapsed().as_secs_f64()
-                        );
+                        let was_interrupted = send_tts_audio(&mut *w, &samples, &tts_interrupted)?;
+                        if was_interrupted {
+                            info!(
+                                "[server] TTS interrupted after {:.2}s",
+                                tts_start.elapsed().as_secs_f64()
+                            );
+                        } else {
+                            info!(
+                                "[server] TTS total (synthesis + send): {:.2}s",
+                                tts_start.elapsed().as_secs_f64()
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!("[server] TTS synthesis failed: {e}");
@@ -284,12 +313,22 @@ fn parse_speed_marker(text: &str) -> (Option<f32>, &str) {
 }
 
 /// Chunk TTS audio samples and send as TtsAudioChunk messages, followed by TtsEnd.
-fn send_tts_audio(writer: &mut impl Write, samples: &[i16]) -> Result<()> {
+/// Returns `true` if interrupted mid-stream, `false` if completed normally.
+fn send_tts_audio(
+    writer: &mut impl Write,
+    samples: &[i16],
+    interrupted: &AtomicBool,
+) -> Result<bool> {
     for chunk in samples.chunks(TTS_CHUNK_SIZE) {
+        if interrupted.load(Ordering::SeqCst) {
+            info!("[server] TTS streaming interrupted — aborting remaining chunks");
+            write_server_msg(writer, &ServerMsg::TtsEnd)?;
+            return Ok(true);
+        }
         write_server_msg(writer, &ServerMsg::TtsAudioChunk(chunk.to_vec()))?;
     }
     write_server_msg(writer, &ServerMsg::TtsEnd)?;
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -817,6 +856,115 @@ mod tests {
         std::fs::remove_file(&sock_path).ok();
     }
 
+    // --- Barge-in / InterruptTts tests ---
+
+    #[test]
+    fn interrupt_tts_aborts_audio_stream() {
+        // NOTE: This integration test involves a race between stt_router (setting the interrupt
+        // flag) and tts_router (sending chunks in a tight loop). MockTtsEngine returns instantly,
+        // so all chunks may be sent before the interrupt propagates on fast machines. If this test
+        // becomes flaky, see the deterministic unit tests below (send_tts_audio_*).
+        // Setup: 20000 samples = 5 chunks of 4000 → enough to interrupt mid-stream
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("ignored", 20000);
+
+        let mut client_w = BufWriter::new(mock_client.try_clone().unwrap());
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // Orchestrator sends a response that will generate 5 audio chunks
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText("Long response".into()),
+        )
+        .unwrap();
+
+        // Read messages until we get at least one TtsAudioChunk, then interrupt
+        let mut chunk_count = 0;
+
+        // First, consume any Text message (AI: ...)
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {} // display text
+                ServerMsg::TtsAudioChunk(_) => {
+                    chunk_count += 1;
+                    // Send interrupt after first chunk
+                    write_client_msg(&mut client_w, &ClientMsg::InterruptTts).unwrap();
+                    // Small delay for interrupt to propagate
+                    std::thread::sleep(Duration::from_millis(50));
+                    break;
+                }
+                other => panic!("Expected Text or TtsAudioChunk, got {other:?}"),
+            }
+        }
+
+        assert!(
+            chunk_count >= 1,
+            "Should have received at least one audio chunk"
+        );
+
+        // Continue reading: should get TtsEnd (possibly after a few more chunks in flight)
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::TtsAudioChunk(_) => chunk_count += 1,
+                ServerMsg::TtsEnd => break,
+                other => panic!("Expected TtsAudioChunk or TtsEnd, got {other:?}"),
+            }
+        }
+
+        // Should have fewer than 5 chunks (interrupted before all sent)
+        assert!(
+            chunk_count < 5,
+            "Expected fewer than 5 chunks due to interrupt, got {chunk_count}"
+        );
+
+        // Cleanup
+        drop(client_w);
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn interrupt_tts_normal_flow_without_interrupt() {
+        // Verify normal flow (no interrupt) still works: all 5 chunks + TtsEnd
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("ignored", 20000);
+
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        write_orchestrator_msg(&mut orch_w, &OrchestratorMsg::ResponseText("Normal".into()))
+            .unwrap();
+
+        let mut chunk_count = 0;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {}
+                ServerMsg::TtsAudioChunk(_) => chunk_count += 1,
+                ServerMsg::TtsEnd => break,
+                other => panic!("Expected Text, TtsAudioChunk or TtsEnd, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            chunk_count, 5,
+            "All 5 chunks should be sent without interrupt"
+        );
+
+        // Cleanup
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
     // --- Speed marker parsing tests ---
 
     #[test]
@@ -840,5 +988,75 @@ mod tests {
 
         let (speed, _) = parse_speed_marker("[SPEED:0.5] Very slow");
         assert_eq!(speed, Some(0.5));
+    }
+
+    // --- Deterministic send_tts_audio unit tests ---
+
+    #[test]
+    fn send_tts_audio_interrupted_before_first_chunk() {
+        let interrupted = AtomicBool::new(true);
+        let samples: Vec<i16> = (0..20000).map(|i| i as i16).collect();
+        let mut buf = Vec::new();
+
+        let was_interrupted = send_tts_audio(&mut buf, &samples, &interrupted).unwrap();
+        assert!(was_interrupted, "Should report interruption");
+
+        // Should contain only TtsEnd (no audio chunks)
+        let mut cursor = std::io::Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        assert!(
+            matches!(msg, ServerMsg::TtsEnd),
+            "Expected TtsEnd, got {msg:?}"
+        );
+        // No more messages
+        assert!(read_server_msg(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn send_tts_audio_completes_without_interrupt() {
+        let interrupted = AtomicBool::new(false);
+        let samples: Vec<i16> = (0..20000).map(|i| i as i16).collect();
+        let mut buf = Vec::new();
+
+        let was_interrupted = send_tts_audio(&mut buf, &samples, &interrupted).unwrap();
+        assert!(!was_interrupted, "Should not report interruption");
+
+        // Should contain 5 TtsAudioChunk + 1 TtsEnd
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut chunk_count = 0;
+        loop {
+            let msg = read_server_msg(&mut cursor).unwrap();
+            match msg {
+                ServerMsg::TtsAudioChunk(c) => {
+                    assert!(c.len() <= TTS_CHUNK_SIZE);
+                    chunk_count += 1;
+                }
+                ServerMsg::TtsEnd => break,
+                other => panic!("Expected TtsAudioChunk or TtsEnd, got {other:?}"),
+            }
+        }
+        assert_eq!(chunk_count, 5, "20000 samples / 4000 = 5 chunks");
+    }
+
+    #[test]
+    fn send_tts_audio_interrupted_mid_stream() {
+        let interrupted = AtomicBool::new(false);
+        let mut buf = Vec::new();
+
+        // First call: send 2 chunks normally (no interrupt)
+        let small_samples: Vec<i16> = (0..8000).map(|i| i as i16).collect();
+        let was_interrupted = send_tts_audio(&mut buf, &small_samples, &interrupted).unwrap();
+        assert!(!was_interrupted);
+
+        // Now test with flag pre-set: 0 chunks should be sent
+        buf.clear();
+        interrupted.store(true, Ordering::SeqCst);
+        let big_samples: Vec<i16> = (0..20000).map(|i| i as i16).collect();
+        let was_interrupted = send_tts_audio(&mut buf, &big_samples, &interrupted).unwrap();
+        assert!(was_interrupted);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ServerMsg::TtsEnd));
     }
 }

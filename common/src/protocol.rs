@@ -22,6 +22,7 @@ pub enum ClientMsg {
     AudioSegment(Vec<i16>), // tag 0x01, payload = raw i16 LE bytes
     PauseRequest,           // tag 0x02, empty payload
     ResumeRequest,          // tag 0x03, empty payload
+    InterruptTts,           // tag 0x04, empty payload
 }
 
 // --- Server messages (server → client, tags 0x80-0xFF) ---
@@ -77,6 +78,11 @@ pub fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> Result<()> {
             w.write_all(&0u32.to_le_bytes())?;
             w.flush()?;
         }
+        ClientMsg::InterruptTts => {
+            w.write_all(&[0x04])?;
+            w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
     }
     Ok(())
 }
@@ -115,6 +121,13 @@ pub fn read_client_msg(r: &mut impl Read) -> Result<ClientMsg> {
                 r.read_exact(&mut discard)?;
             }
             Ok(ClientMsg::ResumeRequest)
+        }
+        0x04 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ClientMsg::InterruptTts)
         }
         other => bail!("Unknown client message tag: 0x{other:02x}"),
     }
@@ -454,6 +467,16 @@ mod tests {
         assert!(matches!(msg, ClientMsg::ResumeRequest));
     }
 
+    #[test]
+    fn round_trip_interrupt_tts() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::InterruptTts).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ClientMsg::InterruptTts));
+    }
+
     // --- Task 2: TtsAudioChunk + TtsEnd ---
 
     #[test]
@@ -591,6 +614,7 @@ mod tests {
         write_client_msg(&mut buf, &ClientMsg::AudioSegment(samples.clone())).unwrap();
         write_client_msg(&mut buf, &ClientMsg::PauseRequest).unwrap();
         write_client_msg(&mut buf, &ClientMsg::ResumeRequest).unwrap();
+        write_client_msg(&mut buf, &ClientMsg::InterruptTts).unwrap();
 
         let mut cursor = Cursor::new(buf);
         match read_client_msg(&mut cursor).unwrap() {
@@ -604,6 +628,10 @@ mod tests {
         assert!(matches!(
             read_client_msg(&mut cursor).unwrap(),
             ClientMsg::ResumeRequest
+        ));
+        assert!(matches!(
+            read_client_msg(&mut cursor).unwrap(),
+            ClientMsg::InterruptTts
         ));
     }
 

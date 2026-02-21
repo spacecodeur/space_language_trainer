@@ -66,6 +66,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     debug!("  Server:  {server_addr}");
     debug!("  Device:  {}", config.device_name);
     debug!("  Hotkey:  {:?}", config.hotkey);
+    debug!("  Mode:    {:?}", config.voice_mode);
 
     // 2. TCP connect + Ready handshake (with exponential backoff retry)
     debug!("Connecting to server...");
@@ -75,41 +76,57 @@ fn run_client(server_override: Option<String>) -> Result<()> {
 
     // 3. Start playback
     let (playback_tx, playback_rx) = crossbeam_channel::bounded::<Vec<i16>>(32);
-    let (_playback_stream, output_rate) = playback::start_playback(playback_rx)?;
+    let playback_clear = Arc::new(AtomicBool::new(false));
+    let (_playback_stream, output_rate) =
+        playback::start_playback(playback_rx, playback_clear.clone())?;
 
     // 4. Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // 5. Spawn tcp_reader thread
+    // 5. TTS playback state tracking (for hotkey interrupt)
+    let is_playing = Arc::new(AtomicBool::new(false));
+    let is_playing_reader = is_playing.clone();
+
+    // 6. Spawn tcp_reader thread
     let tcp_shutdown = shutdown.clone();
     let tcp_reader_handle = std::thread::Builder::new()
         .name("tcp_reader".into())
-        .spawn(move || tcp_reader_loop(reader, playback_tx, output_rate, tcp_shutdown))?;
+        .spawn(move || {
+            tcp_reader_loop(
+                reader,
+                playback_tx,
+                output_rate,
+                tcp_shutdown,
+                is_playing_reader,
+            )
+        })?;
 
-    // 6. Start audio capture
+    // 7. Start audio capture
     let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<i16>>(64);
     let (_capture_stream, capture_config) = audio::start_capture(&config.device, audio_tx)?;
     let mut resample =
         audio::create_resampler(capture_config.sample_rate, 16000, capture_config.channels)?;
 
-    // 7. Hotkey
+    // 8. Hotkey
     let is_listening = Arc::new(AtomicBool::new(false));
     hotkey::listen_all_keyboards(config.hotkey, is_listening.clone())?;
 
-    // 8. Ctrl+C handler
+    // 9. Ctrl+C handler
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
         shutdown_clone.store(true, Ordering::SeqCst);
     })?;
 
-    // 9. Main audio/VAD loop
+    // 10. Main audio/VAD loop
     info!("Ready! Press {:?} to toggle listening.", config.hotkey);
 
+    let voice_mode = config.voice_mode;
     let mut voice_detector = vad::VoiceDetector::new()?;
     let mut writer = writer;
     let mut was_listening = false;
     let mut chunk_count: u64 = 0;
     let mut listening_chunks: u64 = 0;
+    let mut audio_accumulator: Vec<i16> = Vec::new(); // Manual mode: raw audio buffer
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -126,32 +143,93 @@ fn run_client(server_override: Option<String>) -> Result<()> {
         let listening = is_listening.load(Ordering::SeqCst);
 
         if was_listening && !listening {
-            voice_detector.reset();
-            if let Err(e) = write_client_msg(&mut writer, &ClientMsg::PauseRequest) {
-                warn!("[client] Failed to send PauseRequest: {e}");
-                if is_disconnect(&e) {
-                    shutdown.store(true, Ordering::SeqCst);
-                    break;
+            // Send accumulated audio before pausing
+            match voice_mode {
+                tui::VoiceMode::Manual => {
+                    if !audio_accumulator.is_empty() {
+                        let segment = std::mem::take(&mut audio_accumulator);
+                        let duration_ms = segment.len() as f64 / 16.0;
+                        debug!(
+                            "[SENDING...] segment: {} samples ({:.0}ms)",
+                            segment.len(),
+                            duration_ms
+                        );
+                        if let Err(e) =
+                            write_client_msg(&mut writer, &ClientMsg::AudioSegment(segment))
+                        {
+                            if is_disconnect(&e) {
+                                shutdown.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            warn!("[client] Send error: {e}");
+                        }
+                    }
                 }
-            } else {
-                debug!("[client] Sent PauseRequest");
-                info!("[PAUSED]");
+                tui::VoiceMode::Auto => {
+                    // Flush any in-progress VAD segment before pausing
+                    if let Some(segment) = voice_detector.flush() {
+                        let duration_ms = segment.len() as f64 / 16.0;
+                        debug!(
+                            "[SENDING...] flush: {} samples ({:.0}ms)",
+                            segment.len(),
+                            duration_ms
+                        );
+                        if let Err(e) =
+                            write_client_msg(&mut writer, &ClientMsg::AudioSegment(segment))
+                        {
+                            if is_disconnect(&e) {
+                                shutdown.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            warn!("[client] Send error: {e}");
+                        }
+                    }
+                }
             }
+            voice_detector.reset();
+            if voice_mode == tui::VoiceMode::Auto {
+                if let Err(e) = write_client_msg(&mut writer, &ClientMsg::PauseRequest) {
+                    warn!("[client] Failed to send PauseRequest: {e}");
+                    if is_disconnect(&e) {
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                } else {
+                    debug!("[client] Sent PauseRequest");
+                }
+            }
+            info!("[PAUSED]");
             debug!("  (processed {listening_chunks} audio chunks while listening)");
             listening_chunks = 0;
         }
 
         if !was_listening && listening {
-            if let Err(e) = write_client_msg(&mut writer, &ClientMsg::ResumeRequest) {
-                warn!("[client] Failed to send ResumeRequest: {e}");
-                if is_disconnect(&e) {
-                    shutdown.store(true, Ordering::SeqCst);
-                    break;
+            // Interrupt TTS if currently playing (hotkey ON during playback)
+            if is_playing.load(Ordering::SeqCst) {
+                info!("[BARGE-IN] Hotkey interrupt");
+                if let Err(e) = write_client_msg(&mut writer, &ClientMsg::InterruptTts) {
+                    warn!("[client] Failed to send InterruptTts: {e}");
+                    if is_disconnect(&e) {
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
-            } else {
-                debug!("[client] Sent ResumeRequest");
-                info!("[LISTENING]");
+                is_playing.store(false, Ordering::SeqCst);
+                playback_clear.store(true, Ordering::SeqCst);
             }
+            audio_accumulator.clear();
+            if voice_mode == tui::VoiceMode::Auto {
+                if let Err(e) = write_client_msg(&mut writer, &ClientMsg::ResumeRequest) {
+                    warn!("[client] Failed to send ResumeRequest: {e}");
+                    if is_disconnect(&e) {
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                } else {
+                    debug!("[client] Sent ResumeRequest");
+                }
+            }
+            info!("[LISTENING]");
             listening_chunks = 0;
         }
 
@@ -185,27 +263,36 @@ fn run_client(server_override: Option<String>) -> Result<()> {
             );
         }
 
-        let segments = voice_detector.process_samples(&resampled);
-
-        for segment in segments {
-            let duration_ms = segment.len() as f64 / 16.0;
-            debug!(
-                "[SENDING...] segment: {} samples ({:.0}ms)",
-                segment.len(),
-                duration_ms
-            );
-            if let Err(e) = write_client_msg(&mut writer, &ClientMsg::AudioSegment(segment)) {
-                if is_disconnect(&e) {
-                    info!("[client] Server disconnected");
-                    shutdown.store(true, Ordering::SeqCst);
-                    break;
+        match voice_mode {
+            tui::VoiceMode::Manual => {
+                // Accumulate raw audio, send only on hotkey toggle-off
+                audio_accumulator.extend_from_slice(&resampled);
+            }
+            tui::VoiceMode::Auto => {
+                // VAD auto-segmentation: send segments when silence detected
+                let segments = voice_detector.process_samples(&resampled);
+                for segment in segments {
+                    let duration_ms = segment.len() as f64 / 16.0;
+                    debug!(
+                        "[SENDING...] segment: {} samples ({:.0}ms)",
+                        segment.len(),
+                        duration_ms
+                    );
+                    if let Err(e) = write_client_msg(&mut writer, &ClientMsg::AudioSegment(segment))
+                    {
+                        if is_disconnect(&e) {
+                            info!("[client] Server disconnected");
+                            shutdown.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        warn!("[client] Send error: {e}");
+                    }
                 }
-                warn!("[client] Send error: {e}");
             }
         }
     }
 
-    // 10. Graceful shutdown
+    // 11. Graceful shutdown
     info!("Shutting down...");
 
     drop(_capture_stream);
@@ -231,6 +318,7 @@ fn tcp_reader_loop(
     playback_tx: crossbeam_channel::Sender<Vec<i16>>,
     output_rate: u32,
     shutdown: Arc<AtomicBool>,
+    is_playing: Arc<AtomicBool>,
 ) {
     // Create resampler if playback device isn't 16kHz
     let mut resample: Option<audio::ResamplerFn> = if output_rate != 16000 {
@@ -269,6 +357,7 @@ fn tcp_reader_loop(
         match msg {
             ServerMsg::TtsAudioChunk(samples) => {
                 debug!("[client] TtsAudioChunk: {} samples", samples.len());
+                is_playing.store(true, Ordering::SeqCst);
                 let output = match &mut resample {
                     Some(r) => r(&samples),
                     None => samples,
@@ -280,6 +369,7 @@ fn tcp_reader_loop(
             }
             ServerMsg::TtsEnd => {
                 debug!("[client] TtsEnd received");
+                is_playing.store(false, Ordering::SeqCst);
             }
             ServerMsg::Ready => {
                 debug!("[client] Unexpected Ready (ignoring)");

@@ -59,7 +59,7 @@ impl KokoroTts {
         } else {
             "cpu"
         };
-        let num_threads = 8;
+        let num_threads = 16;
 
         debug!("[server] TTS provider: {provider}, threads: {num_threads}");
 

@@ -7,11 +7,18 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use std::time::Duration;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VoiceMode {
+    Manual, // Push-to-talk: hotkey toggle-off sends accumulated audio
+    Auto,   // VAD auto-segmentation on silence (original behavior)
+}
+
 pub struct SetupConfig {
     pub server_addr: String,
     pub device: cpal::Device,
     pub device_name: String,
     pub hotkey: EvdevKeyCode,
+    pub voice_mode: VoiceMode,
 }
 
 pub fn run_setup() -> Result<SetupConfig> {
@@ -57,7 +64,25 @@ pub fn run_setup() -> Result<SetupConfig> {
         }
     };
 
+    // Screen 3: Voice Mode selection
+    let mode_choices = vec![
+        "Manual (hotkey controls when to send)".to_string(),
+        "Auto (VAD segments on silence)".to_string(),
+    ];
+    let mode_idx = match select_screen(&mut terminal, "Select Voice Mode", &mode_choices) {
+        Ok(idx) => idx,
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    };
+
     ratatui::restore();
+
+    let voice_mode = match mode_idx {
+        0 => VoiceMode::Manual,
+        _ => VoiceMode::Auto,
+    };
 
     let hotkey = match hotkey_idx {
         0 => EvdevKeyCode::KEY_F2,
@@ -77,6 +102,7 @@ pub fn run_setup() -> Result<SetupConfig> {
         device,
         device_name,
         hotkey,
+        voice_mode,
     })
 }
 

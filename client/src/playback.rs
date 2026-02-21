@@ -1,14 +1,22 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::Receiver;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use space_lt_common::{info, warn};
 
 /// Start an audio output stream that plays TTS audio from the given channel.
 ///
+/// The `clear` flag allows the caller to flush the playback buffer (e.g. on barge-in).
+/// When set to `true`, the callback drains leftover and channel, fills silence, and resets the flag.
+///
 /// Returns the cpal Stream (must be kept alive for playback to continue)
 /// and the actual output sample rate (for resampling if needed).
-pub fn start_playback(audio_rx: Receiver<Vec<i16>>) -> Result<(cpal::Stream, u32)> {
+pub fn start_playback(
+    audio_rx: Receiver<Vec<i16>>,
+    clear: Arc<AtomicBool>,
+) -> Result<(cpal::Stream, u32)> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -48,6 +56,15 @@ pub fn start_playback(audio_rx: Receiver<Vec<i16>>) -> Result<(cpal::Stream, u32
         .build_output_stream(
             &config,
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                // Barge-in clear: flush all buffered audio and output silence
+                if clear.load(Ordering::SeqCst) {
+                    clear.store(false, Ordering::SeqCst);
+                    leftover.clear();
+                    while audio_rx.try_recv().is_ok() {}
+                    data.fill(0);
+                    return;
+                }
+
                 let mut offset = 0;
 
                 // First, drain any leftover samples from the previous callback
