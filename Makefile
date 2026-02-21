@@ -5,7 +5,6 @@ TTS_LANG        ?= en
 SERVER_PORT     ?= 9500
 SOCKET_PATH     ?= /tmp/space_lt_server.sock
 AGENT           ?= agent/language_trainer.agent.md
-SERVER_ADDR     ?= 127.0.0.1:$(SERVER_PORT)
 CUDA            ?= 1
 DEBUG           ?= 0
 
@@ -72,5 +71,5 @@ run-orchestrator:
 
 run-client:
 	cargo run -p space_lt_client -- \
-		--server $(SERVER_ADDR) \
+		$(if $(SERVER_ADDR),--server $(SERVER_ADDR)) \
 		$(DEBUG_FLAG)
