@@ -2,8 +2,11 @@
 set -euo pipefail
 
 MODELS_DIR="$HOME/.local/share/space_lt/models"
+TTS_MODELS_DIR="$HOME/.local/share/space_lt/tts-models"
 DOTOOL_REPO="https://git.sr.ht/~geb/dotool"
 HF_BASE="https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+KOKORO_BASE="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models"
+KOKORO_MODEL="kokoro-en-v0_19"
 
 # --- Helpers ---
 
@@ -54,14 +57,14 @@ install_server_deps() {
 
     case "$pm" in
         dnf)
-            sudo dnf install -y cmake gcc gcc-c++ pkg-config
+            sudo dnf install -y cmake gcc gcc-c++ pkg-config clang-devel
             ;;
         apt)
             sudo apt-get update
-            sudo apt-get install -y cmake gcc g++ pkg-config
+            sudo apt-get install -y cmake gcc g++ pkg-config libclang-dev
             ;;
         pacman)
-            sudo pacman -S --needed --noconfirm cmake gcc pkgconf
+            sudo pacman -S --needed --noconfirm cmake gcc pkgconf clang
             ;;
     esac
 }
@@ -72,14 +75,14 @@ install_build_deps() {
 
     case "$pm" in
         dnf)
-            sudo dnf install -y cmake gcc gcc-c++ pkg-config alsa-lib-devel
+            sudo dnf install -y cmake gcc gcc-c++ pkg-config alsa-lib-devel clang-devel
             ;;
         apt)
             sudo apt-get update
-            sudo apt-get install -y cmake gcc g++ pkg-config libasound2-dev
+            sudo apt-get install -y cmake gcc g++ pkg-config libasound2-dev libclang-dev
             ;;
         pacman)
-            sudo pacman -S --needed --noconfirm cmake gcc pkgconf alsa-lib
+            sudo pacman -S --needed --noconfirm cmake gcc pkgconf alsa-lib clang
             ;;
     esac
 }
@@ -237,6 +240,45 @@ download_model() {
     info "Model saved to $MODELS_DIR/$model_name"
 }
 
+# --- Kokoro TTS model ---
+
+download_tts_model() {
+    local model_dir="$TTS_MODELS_DIR/$KOKORO_MODEL"
+
+    if [ -f "$model_dir/model.onnx" ]; then
+        info "Kokoro TTS model already present: $model_dir"
+        return 0
+    fi
+
+    info "Downloading Kokoro TTS model ($KOKORO_MODEL)..."
+    mkdir -p "$TTS_MODELS_DIR"
+
+    local tarball="${KOKORO_MODEL}.tar.bz2"
+    local url="$KOKORO_BASE/$tarball"
+
+    wget -P "$TTS_MODELS_DIR" "$url"
+    info "Extracting $tarball..."
+    tar -xjf "$TTS_MODELS_DIR/$tarball" -C "$TTS_MODELS_DIR"
+    rm -f "$TTS_MODELS_DIR/$tarball"
+
+    if [ -f "$model_dir/model.onnx" ]; then
+        info "Kokoro TTS model installed to $model_dir"
+    else
+        warn "model.onnx not found after extraction. Check $TTS_MODELS_DIR manually."
+    fi
+}
+
+# --- Claude CLI ---
+
+check_claude_cli() {
+    if command -v claude &>/dev/null; then
+        info "Claude CLI found: $(command -v claude)"
+    else
+        warn "Claude CLI not found. The orchestrator requires it."
+        warn "Install: https://docs.anthropic.com/en/docs/claude-code/overview"
+    fi
+}
+
 # --- Build ---
 
 build_project() {
@@ -276,6 +318,7 @@ build_project() {
             cargo build $build_flags
             sudo cp "$dir/target/release/space_lt_server" /usr/local/bin/
             sudo cp "$dir/target/release/space_lt_client" /usr/local/bin/
+            sudo cp "$dir/target/release/space_lt_orchestrator" /usr/local/bin/
             info "Installed binaries to /usr/local/bin/"
             ;;
     esac
@@ -293,7 +336,7 @@ do_uninstall() {
     dir=$(project_dir)
 
     # 1. Remove installed binaries
-    for bin in /usr/local/bin/space_lt_server /usr/local/bin/space_lt_client; do
+    for bin in /usr/local/bin/space_lt_server /usr/local/bin/space_lt_client /usr/local/bin/space_lt_orchestrator; do
         if [ -f "$bin" ]; then
             sudo rm -f "$bin"
             info "Removed $bin"
@@ -316,11 +359,23 @@ do_uninstall() {
         ask "Remove Whisper models ($MODELS_DIR, $model_size)? [y/N]"
         if [[ "$REPLY" =~ ^[yY]$ ]]; then
             rm -rf "$MODELS_DIR"
-            # Remove parent dirs if empty
-            rmdir --ignore-fail-on-non-empty "$HOME/.local/share/space_lt" 2>/dev/null || true
-            info "Models removed."
+            info "Whisper models removed."
         fi
     fi
+
+    # 3b. Remove TTS models
+    if [ -d "$TTS_MODELS_DIR" ]; then
+        local tts_size
+        tts_size=$(du -sh "$TTS_MODELS_DIR" 2>/dev/null | cut -f1)
+        ask "Remove Kokoro TTS models ($TTS_MODELS_DIR, $tts_size)? [y/N]"
+        if [[ "$REPLY" =~ ^[yY]$ ]]; then
+            rm -rf "$TTS_MODELS_DIR"
+            info "TTS models removed."
+        fi
+    fi
+
+    # Clean up parent dir if empty
+    rmdir --ignore-fail-on-non-empty "$HOME/.local/share/space_lt" 2>/dev/null || true
 
     # 4. Remove dotool
     ask "Remove dotool? [y/N]"
@@ -438,13 +493,20 @@ do_install_server() {
     download_model
 
     echo
+    download_tts_model
+
+    echo
+    check_claude_cli
+
+    echo
     build_project server
 
     echo
     echo "========================================="
     info "Server setup complete!"
     echo
-    echo "  Run:  space_lt_server --list-models"
+    echo "  Server:       space_lt_server --list-models"
+    echo "  TTS models:   $TTS_MODELS_DIR"
     echo "========================================="
 }
 
@@ -476,14 +538,22 @@ do_install() {
     download_model
 
     echo
+    download_tts_model
+
+    echo
+    check_claude_cli
+
+    echo
     build_project
 
     echo
     echo "========================================="
     info "Setup complete!"
     echo
-    echo "  Client:  space_lt_client"
-    echo "  Server:  space_lt_server --list-models"
+    echo "  Client:       space_lt_client"
+    echo "  Server:       space_lt_server --list-models"
+    echo "  Orchestrator: space_lt_orchestrator --agent agent/language_trainer.agent.md"
+    echo "  TTS models:   $TTS_MODELS_DIR"
     echo
     if ! id -nG "$USER" | grep -qw input; then
         warn "Remember to log out/in for the 'input' group to take effect."
@@ -497,11 +567,12 @@ usage() {
     echo "Usage: $0 <command> [target]"
     echo
     echo "Commands:"
-    echo "  install           Install everything (client + server)"
+    echo "  install           Install everything (client + server + orchestrator)"
     echo "  install client    Install client only (hotkey, audio, dotool)"
-    echo "  install server    Install server only (whisper, CUDA, models)"
+    echo "  install server    Install server only (whisper, TTS, CUDA, models)"
     echo "  uninstall         Remove everything cleanly"
-    echo "  model             Download a Whisper model"
+    echo "  model             Download a Whisper STT model"
+    echo "  tts-model         Download Kokoro TTS model"
 }
 
 case "${1:-}" in
@@ -518,6 +589,9 @@ case "${1:-}" in
         ;;
     model)
         download_model
+        ;;
+    tts-model)
+        download_tts_model
         ;;
     *)
         usage
