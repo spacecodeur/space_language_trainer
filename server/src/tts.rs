@@ -7,6 +7,7 @@ use space_lt_common::debug;
 /// Trait abstracting TTS synthesis. Returns 16kHz mono i16 samples.
 pub trait TtsEngine: Send {
     fn synthesize(&self, text: &str) -> Result<Vec<i16>>;
+    fn set_speed(&self, speed: f32);
 }
 
 /// Kokoro TTS engine via sherpa-rs (sherpa-onnx FFI).
@@ -15,6 +16,7 @@ pub trait TtsEngine: Send {
 pub struct KokoroTts {
     tts: Mutex<sherpa_rs::tts::KokoroTts>,
     speaker_id: i32,
+    speed: Mutex<f32>,
 }
 
 impl KokoroTts {
@@ -52,7 +54,7 @@ impl KokoroTts {
         // Build lexicon: include all lexicon-*.txt files found in the directory
         let lexicon = build_lexicon_path(model_dir);
 
-        let provider = if cfg!(feature = "cuda") {
+        let provider = if cfg!(feature = "cuda-tts") {
             "cuda"
         } else {
             "cpu"
@@ -96,6 +98,7 @@ impl KokoroTts {
         Ok(Self {
             tts: Mutex::new(tts),
             speaker_id: 0, // default: first voice (af_alloy)
+            speed: Mutex::new(0.8),
         })
     }
 }
@@ -107,8 +110,13 @@ impl TtsEngine for KokoroTts {
             .lock()
             .map_err(|e| anyhow::anyhow!("TTS mutex poisoned: {e}"))?;
 
+        let speed = *self
+            .speed
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Speed mutex poisoned: {e}"))?;
+
         let audio = tts
-            .create(text, self.speaker_id, 0.8)
+            .create(text, self.speaker_id, speed)
             .map_err(|e| anyhow::anyhow!("TTS synthesis failed: {e}"))?;
 
         debug!(
@@ -126,6 +134,12 @@ impl TtsEngine for KokoroTts {
             .collect();
 
         Ok(samples)
+    }
+
+    fn set_speed(&self, speed: f32) {
+        if let Ok(mut s) = self.speed.lock() {
+            *s = speed.clamp(0.3, 2.0);
+        }
     }
 }
 
@@ -246,6 +260,8 @@ mod tests {
                 .collect();
             Ok(samples)
         }
+
+        fn set_speed(&self, _speed: f32) {}
     }
 
     #[test]

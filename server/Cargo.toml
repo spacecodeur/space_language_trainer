@@ -5,7 +5,10 @@ edition = "2024"
 
 [features]
 default = []
-cuda = ["whisper-rs/cuda", "sherpa-rs/cuda"]
+cuda = ["cuda-whisper"]
+cuda-whisper = ["whisper-rs/cuda"]
+cuda-tts = ["sherpa-rs/cuda"]
+cuda-all = ["cuda-whisper", "cuda-tts"]
 
 [dependencies]
 space_lt_common = { path = "../common" }

@@ -188,32 +188,32 @@ The user can handle real-life interruptions gracefully and benefit from stable, 
 Claude acts as an adaptive English tutor with real-time corrections, diverse scenarios, and CEFR-based level assessment.
 - Complete `language_trainer.agent.md`: coaching persona, CEFR methodology, feedback rules
 - Real-time corrections (default) + deferred feedback on vocal request
-- Initial level assessment when no tracking files exist
 - Scenario handling: free conversation, grammar drills, interview simulation, topic discussion with web search, level assessment
-- Focus area suggestions based on NZ departure countdown and identified weak points
 - Web search integration for topic-based discussions
-**FRs covered:** FR12, FR25, FR26, FR27, FR28, FR29, FR30
+- ~~Story 4.3 (initial assessment + focus suggestions) cancelled — Claude adapts level naturally~~
+**FRs covered:** FR12, FR25, FR26, FR27, FR28
 
-### Epic 5: Cross-Session Progress Tracking
-The user can track English progression across sessions with automated synthesis, context continuity, and persistent learning insights.
-- Per-session synthesis file generation (timestamped)
-- 5 tracking files: session synthesis, progression, meta (CEFR + NZ countdown), weak points, vocabulary journal
-- Context loading at session start (tracking files → Claude context)
-- Session lifecycle handshake (SessionStart/SessionEnd messages)
-- Atomic file writes (temp + rename) for crash safety
-**FRs covered:** FR11, FR13, FR19, FR20, FR21, FR22, FR23, FR24
+### ~~Epic 5: Cross-Session Progress Tracking~~ (CANCELLED)
+~~Cancelled — too rigid, constrains the app into a specific learning framework. App works better as general-purpose conversational tool.~~
+
+### Epic 6: Voice UX & Performance
+The user enjoys a more natural and responsive voice conversation with lower latency and the ability to interrupt the AI mid-speech.
+- Barge-in: user can interrupt TTS playback by speaking (natural turn-taking)
+- Streaming TTS: sentences synthesized and sent incrementally (reduced perceived latency)
 
 ### Epic Dependencies
 
 ```
 Epic 1 (Foundation)
   └──► Epic 2 (Voice Conversation)
-         ├──► Epic 3 (Session Control)    [independent]
-         ├──► Epic 4 (Language Coaching)   [independent]
-         └──► Epic 5 (Progress Tracking)  [independent]
+         ├──► Epic 3 (Session Control)    [done]
+         ├──► Epic 4 (Language Coaching)   [done]
+         └──► Epic 6 (Voice UX & Perf)    [backlog]
+                 6.1 Barge-in
+                 6.2 Streaming TTS (depends on 6.1 for interrupt handling)
 ```
 
-Epics 3, 4, and 5 are independent of each other. They all depend on Epic 2 but can be implemented in any order.
+Story 6.2 (streaming TTS) depends on 6.1 (barge-in) because streaming needs interrupt support to handle mid-stream barge-in correctly.
 
 ## Epic 1: Project Foundation & Feasibility Validation
 
@@ -477,93 +477,68 @@ So that I can tailor each session to my learning needs.
 **And** web search is used when the user requests topic-based discussion (FR12)
 **And** manual E2E test: switch feedback modes vocally, request 3 different scenarios, verify smooth transitions
 
-### Story 4.3: Initial Level Assessment and Focus Suggestions
+### ~~Story 4.3: Initial Level Assessment and Focus Suggestions~~ (CANCELLED)
+
+Cancelled — Claude already adapts level naturally via the Level Detection section in the agent prompt. Formal assessment and rigid focus suggestions would reduce the app's general-purpose flexibility without meaningful benefit.
+
+## ~~Epic 5: Cross-Session Progress Tracking~~ (CANCELLED)
+
+Cancelled — The tracking system (5 markdown files, session synthesis, meta-tracking) would constrain the app into a rigid learning framework. The app works better as a general-purpose conversational English practice tool. Claude already adapts naturally within each session.
+
+## Epic 6: Voice UX & Performance
+
+The user enjoys a more natural and responsive voice conversation experience with lower latency and the ability to interrupt the AI mid-speech.
+
+### Story 6.1: Barge-in Interruption
 
 As a **user**,
-I want Claude to assess my English level on first use and suggest focus areas based on my weak points and NZ trip timeline,
-So that my practice is targeted and efficient.
+I want to interrupt the AI's spoken response by starting to speak,
+So that I can naturally take my turn without waiting for the AI to finish talking.
 
 **Acceptance Criteria:**
 
-**Given** no previous tracking files exist (first session)
-**When** the session starts
-**Then** Claude detects the absence of tracking files and initiates a conversational level assessment (FR29)
-**And** assessment covers: speaking fluency, grammar accuracy, vocabulary range, listening comprehension
-**And** after assessment, Claude estimates CEFR level and communicates it
+**Given** the AI is currently speaking (TTS audio playing on client)
+**When** the user starts speaking (VAD detects voice activity)
+**Then** the client immediately stops TTS audio playback
+**And** the client sends an `InterruptTts(0x04)` message to the server
+**And** the server aborts any ongoing TTS synthesis for the current response
+**And** the user's speech is captured, transcribed, and processed as a new conversation turn
+**And** the conversation continues naturally from the user's interruption
+**And** barge-in detection responds within 300ms of user voice onset
 
-**Given** tracking files exist with weak points and meta document (subsequent sessions)
-**When** the session starts
-**Then** Claude suggests focus areas based on remaining time before NZ trip (May 2026) and identified weak points (FR30)
-**And** suggestions are actionable (e.g., "You have 3 months left. Based on your recurring issues with present perfect, let's focus on that today")
+**Given** the AI is speaking and the user does NOT speak
+**When** background noise occurs (cough, door slam, etc.)
+**Then** VAD does not trigger barge-in (only sustained speech triggers interruption)
+**And** TTS playback continues uninterrupted
 
-**And** manual E2E test: first session without tracking files — verify assessment happens; subsequent session with mock tracking files — verify focus suggestions
+**And** new protocol message: `InterruptTts(0x04)` — client→server, empty payload
+**And** integration test: mock TTS playback, simulate VAD trigger, verify playback stops and InterruptTts is sent
+**And** manual E2E test: mid-AI-response, start speaking, verify AI stops and processes the new input
 
-## Epic 5: Cross-Session Progress Tracking
-
-The user can track English progression across sessions with automated synthesis, context continuity, and persistent learning insights.
-
-### Story 5.1: Session Context Loading
+### Story 6.2: Streaming TTS Pipeline
 
 As a **user**,
-I want each session to start with awareness of my previous progress,
-So that Claude picks up where we left off and doesn't repeat the same ground.
+I want to hear the AI's response start playing as soon as possible, without waiting for the entire response to be synthesized,
+So that conversations feel faster and more natural.
 
 **Acceptance Criteria:**
 
-**Given** tracking files exist in `~/language-training/` (meta.md, weak-points.md, recent session syntheses)
-**When** the orchestrator starts a new session
-**Then** it reads the meta tracking document, weak points tracker, and the 3 most recent session syntheses
-**And** these are included in the Claude CLI invocation context (appended to the prompt or via file references)
-**And** Claude demonstrates awareness of previous sessions in its greeting (e.g., references past topics, known weak points)
-**And** if no tracking files exist (first session), the orchestrator proceeds without context loading (triggers assessment in Epic 4)
+**Given** the server receives a `ResponseText(0xA1)` from the orchestrator
+**When** the text contains multiple sentences
+**Then** the server splits the text into sentences and synthesizes them sequentially
+**And** the first sentence's audio is sent to the client as `TtsAudioChunk(0x83)` while the second sentence is being synthesized
+**And** audio chunks flow continuously without gaps between sentences
+**And** `TtsEnd(0x84)` is sent only after the final sentence's audio is complete
 
-**Given** a `SessionStart(0xA2)` message from the orchestrator
-**When** server receives it
-**Then** server acknowledges with `Ready(0x80)` and begins processing client audio
-**And** the session directory path is communicated via the SessionStart JSON payload
+**Given** a short response (single sentence)
+**When** TTS synthesis completes
+**Then** behavior is identical to current implementation (no regression)
 
-**And** integration test: mock tracking files, verify orchestrator reads and includes them in Claude context
-**And** manual E2E test: after 2+ sessions, start a new session, verify Claude references previous progress
+**Given** a barge-in occurs mid-stream (Story 6.1)
+**When** `InterruptTts(0x04)` is received
+**Then** the server stops synthesizing remaining sentences immediately
+**And** no further `TtsAudioChunk` messages are sent for the interrupted response
 
-### Story 5.2: Session Synthesis and Tracking File Generation
-
-As a **user**,
-I want a detailed synthesis of each session automatically generated at session end,
-So that I can review what was covered and track my improvement over time.
-
-**Acceptance Criteria:**
-
-**Given** an active session that is ending (user quits or says "let's wrap up")
-**When** the orchestrator triggers session end
-**Then** Claude generates a timestamped per-session synthesis file (e.g., `2026-02-20T19-00_session.md`) containing: topics covered, errors made, corrections given, vocabulary learned, session assessment (FR19)
-**And** Claude updates the general progression document with a chronological summary of this session (FR20)
-**And** Claude updates the vocabulary journal with new words and expressions from this session, with usage context (FR23)
-**And** all files are written to the `~/language-training/` session directory
-**And** file writes are atomic: write to temp file then `fs::rename()` — crash cannot corrupt existing data (NFR13)
-**And** orchestrator sends `SessionEnd(0xA3)` to server after files are generated
-
-**And** manual E2E test: complete a 5-minute session, verify synthesis file is generated with correct content, progression document is updated
-
-### Story 5.3: Meta Tracking, Weak Points, and Vocabulary Maintenance
-
-As a **user**,
-I want persistent tracking of my CEFR level, recurring error patterns, and vocabulary growth across all sessions,
-So that I can see long-term progress and focus on areas that need improvement.
-
-**Acceptance Criteria:**
-
-**Given** a session has just ended
-**When** Claude generates end-of-session tracking updates
-**Then** the meta tracking document (`meta.md`) is updated with: current CEFR level estimate, NZ departure countdown (May 2026), suggested focus areas for next session, milestones achieved (FR21)
-**And** the recurring weak points tracker (`weak-points.md`) is updated: new error patterns added, resolved patterns marked, recurring errors highlighted with frequency (FR22)
-**And** all updates are atomic (temp + rename) (NFR13)
-
-**Given** the tracking system has data from 5+ sessions
-**When** the user reviews `weak-points.md`
-**Then** it shows a clear picture of persistent vs resolved error patterns
-**When** the user reviews `meta.md`
-**Then** it shows CEFR progression over time and remaining NZ countdown
-**When** the user reviews `vocabulary.md`
-**Then** it shows cumulative vocabulary growth with session-by-session entries and usage context
-
-**And** manual E2E test: after 5+ sessions, review all tracking files, verify they accurately reflect session history
+**And** perceived latency (user finishes speaking → first audio plays) is reduced by at least 40% compared to current batch approach
+**And** integration test: multi-sentence text, verify first chunk arrives before full synthesis completes
+**And** manual E2E test: ask a question requiring a 3-sentence response, verify audio starts noticeably faster

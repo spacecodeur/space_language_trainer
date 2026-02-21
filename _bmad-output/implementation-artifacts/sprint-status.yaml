@@ -64,15 +64,21 @@ development_status:
   epic-3-retrospective: optional
 
   # Epic 4: Intelligent Language Coaching
-  epic-4: in-progress
+  epic-4: done
   4-1-core-language-coaching-persona-and-real-time-feedback: done
   4-2-deferred-feedback-and-scenario-handling: done
-  4-3-initial-level-assessment-and-focus-suggestions: backlog
+  4-3-initial-level-assessment-and-focus-suggestions: cancelled
   epic-4-retrospective: optional
 
-  # Epic 5: Cross-Session Progress Tracking
-  epic-5: backlog
-  5-1-session-context-loading: backlog
-  5-2-session-synthesis-and-tracking-file-generation: backlog
-  5-3-meta-tracking-weak-points-and-vocabulary-maintenance: backlog
-  epic-5-retrospective: optional
+  # Epic 5: Cross-Session Progress Tracking (CANCELLED — too rigid, app works better as general-purpose tool)
+  epic-5: cancelled
+  5-1-session-context-loading: cancelled
+  5-2-session-synthesis-and-tracking-file-generation: cancelled
+  5-3-meta-tracking-weak-points-and-vocabulary-maintenance: cancelled
+  epic-5-retrospective: cancelled
+
+  # Epic 6: Voice UX & Performance
+  epic-6: backlog
+  6-1-barge-in-interruption: backlog
+  6-2-streaming-tts-pipeline: backlog
+  epic-6-retrospective: optional

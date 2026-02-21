@@ -63,12 +63,12 @@ fn run_client(server_override: Option<String>) -> Result<()> {
 
     let server_addr = server_override.unwrap_or(config.server_addr);
 
-    info!("  Server:  {server_addr}");
-    info!("  Device:  {}", config.device_name);
-    info!("  Hotkey:  {:?}", config.hotkey);
+    debug!("  Server:  {server_addr}");
+    debug!("  Device:  {}", config.device_name);
+    debug!("  Hotkey:  {:?}", config.hotkey);
 
     // 2. TCP connect + Ready handshake (with exponential backoff retry)
-    info!("Connecting to server...");
+    debug!("Connecting to server...");
     let conn = connection::TcpConnection::connect_with_retry(&server_addr)?;
     let shutdown_stream = conn.try_clone_stream()?;
     let (reader, writer) = conn.into_split();
@@ -134,7 +134,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                     break;
                 }
             } else {
-                info!("[client] Sent PauseRequest");
+                debug!("[client] Sent PauseRequest");
                 info!("[PAUSED]");
             }
             debug!("  (processed {listening_chunks} audio chunks while listening)");
@@ -149,7 +149,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                     break;
                 }
             } else {
-                info!("[client] Sent ResumeRequest");
+                debug!("[client] Sent ResumeRequest");
                 info!("[LISTENING]");
             }
             listening_chunks = 0;
@@ -236,7 +236,7 @@ fn tcp_reader_loop(
     let mut resample: Option<audio::ResamplerFn> = if output_rate != 16000 {
         match audio::create_resampler(16000, output_rate, 1) {
             Ok(r) => {
-                info!("[client] TTS resampling: 16kHz → {output_rate}Hz");
+                debug!("[client] TTS resampling: 16kHz → {output_rate}Hz");
                 Some(r)
             }
             Err(e) => {
@@ -257,7 +257,7 @@ fn tcp_reader_loop(
             Ok(msg) => msg,
             Err(e) => {
                 if is_disconnect(&e) {
-                    info!("[client] Server disconnected");
+                    debug!("[client] Server disconnected");
                 } else {
                     warn!("[client] Read error: {e}");
                 }
@@ -285,7 +285,7 @@ fn tcp_reader_loop(
                 debug!("[client] Unexpected Ready (ignoring)");
             }
             ServerMsg::Text(text) => {
-                debug!("[client] Unexpected Text: \"{text}\" (ignoring)");
+                info!("[client] {text}");
             }
             ServerMsg::Error(err) => {
                 warn!("[client] Server error: {err}");

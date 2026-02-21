@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use space_lt_common::protocol::{
@@ -47,8 +47,14 @@ pub fn run_session(
         .try_clone()
         .context("cloning Unix stream for cleanup")?;
 
-    // tcp_stream → writer for tts_router, tcp_for_read → reader for stt_router
+    // tcp_for_read → reader for stt_router
     // unix_stream → writer for stt_router, unix_for_read → reader for tts_router
+    // tcp_stream → shared BufWriter for both threads (display text + TTS audio)
+
+    // Shared TCP writer: stt_router sends "You: ..." display text,
+    // tts_router sends "AI: ..." display text + TTS audio chunks
+    let client_writer = Arc::new(Mutex::new(BufWriter::new(tcp_stream)));
+    let client_writer_stt = client_writer.clone();
 
     // Shared pause state between stt_router and tts_router
     let paused = Arc::new(AtomicBool::new(false));
@@ -57,11 +63,19 @@ pub fn run_session(
 
     let stt_handle = std::thread::Builder::new()
         .name("stt_router".into())
-        .spawn(move || stt_router(tcp_for_read, unix_stream, transcriber, paused_stt))?;
+        .spawn(move || {
+            stt_router(
+                tcp_for_read,
+                unix_stream,
+                transcriber,
+                paused_stt,
+                client_writer_stt,
+            )
+        })?;
 
     let tts_handle = std::thread::Builder::new()
         .name("tts_router".into())
-        .spawn(move || tts_router(unix_for_read, tcp_stream, tts, paused_tts))?;
+        .spawn(move || tts_router(unix_for_read, client_writer, tts, paused_tts))?;
 
     // Wait for either thread to finish (connection close or error)
     loop {
@@ -97,6 +111,7 @@ fn stt_router(
     unix_write: UnixStream,
     mut transcriber: Box<dyn Transcriber>,
     paused: Arc<AtomicBool>,
+    client_writer: Arc<Mutex<BufWriter<TcpStream>>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(tcp_read);
     let mut writer = BufWriter::new(unix_write);
@@ -135,6 +150,10 @@ fn stt_router(
 
                 if !text.is_empty() {
                     debug!("[server] Transcribed: \"{}\"", text);
+                    // Display transcription on client
+                    if let Ok(mut w) = client_writer.lock() {
+                        let _ = write_server_msg(&mut *w, &ServerMsg::Text(format!("You: {text}")));
+                    }
                     write_orchestrator_msg(&mut writer, &OrchestratorMsg::TranscribedText(text))?;
                 }
             }
@@ -155,12 +174,11 @@ fn stt_router(
 /// TTS routing: reads OrchestratorMsg from Unix, synthesizes speech, streams to client.
 fn tts_router(
     unix_read: UnixStream,
-    tcp_write: TcpStream,
+    client_writer: Arc<Mutex<BufWriter<TcpStream>>>,
     tts: Box<dyn TtsEngine>,
     paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut reader = BufReader::new(unix_read);
-    let mut writer = BufWriter::new(tcp_write);
 
     loop {
         let msg = match read_orchestrator_msg(&mut reader) {
@@ -181,14 +199,34 @@ fn tts_router(
                         "[server] Paused — skipping TTS for response ({} chars)",
                         text.len()
                     );
-                    write_server_msg(&mut writer, &ServerMsg::TtsEnd)?;
+                    let mut w = client_writer
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                    write_server_msg(&mut *w, &ServerMsg::TtsEnd)?;
                     continue;
                 }
 
-                debug!("[server] ResponseText: {} chars", text.len());
+                // Parse optional speed marker (e.g. "[SPEED:0.6] Hello")
+                let (speed, clean_text) = parse_speed_marker(&text);
+                if let Some(s) = speed {
+                    tts.set_speed(s);
+                    info!("[server] TTS speed set to {s}");
+                }
+
+                debug!("[server] ResponseText: {} chars", clean_text.len());
+
+                // Display AI response on client
+                {
+                    let mut w = client_writer
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                    let _ =
+                        write_server_msg(&mut *w, &ServerMsg::Text(format!("AI: {clean_text}")));
+                }
+
                 let tts_start = std::time::Instant::now();
 
-                match tts.synthesize(&text) {
+                match tts.synthesize(clean_text) {
                     Ok(samples) => {
                         let synth_elapsed = tts_start.elapsed();
                         let audio_duration = samples.len() as f64 / 16000.0;
@@ -196,9 +234,12 @@ fn tts_router(
                             "[server] TTS synthesis: {:.2}s for {:.2}s of audio ({} chars)",
                             synth_elapsed.as_secs_f64(),
                             audio_duration,
-                            text.len()
+                            clean_text.len()
                         );
-                        send_tts_audio(&mut writer, &samples)?;
+                        let mut w = client_writer
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                        send_tts_audio(&mut *w, &samples)?;
                         info!(
                             "[server] TTS total (synthesis + send): {:.2}s",
                             tts_start.elapsed().as_secs_f64()
@@ -206,7 +247,10 @@ fn tts_router(
                     }
                     Err(e) => {
                         warn!("[server] TTS synthesis failed: {e}");
-                        write_server_msg(&mut writer, &ServerMsg::TtsEnd)?;
+                        let mut w = client_writer
+                            .lock()
+                            .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                        write_server_msg(&mut *w, &ServerMsg::TtsEnd)?;
                     }
                 }
             }
@@ -224,6 +268,19 @@ fn tts_router(
     }
 
     Ok(())
+}
+
+/// Parse an optional `[SPEED:X.X]` marker at the start of a response.
+/// Returns the speed value (if present) and the remaining text.
+fn parse_speed_marker(text: &str) -> (Option<f32>, &str) {
+    if let Some(rest) = text.strip_prefix("[SPEED:")
+        && let Some(end) = rest.find(']')
+        && let Ok(speed) = rest[..end].parse::<f32>()
+    {
+        let remaining = rest[end + 1..].trim_start();
+        return (Some(speed), remaining);
+    }
+    (None, text)
 }
 
 /// Chunk TTS audio samples and send as TtsAudioChunk messages, followed by TtsEnd.
@@ -278,6 +335,8 @@ mod tests {
             // Return a simple ramp pattern for easy verification
             Ok((0..self.sample_count).map(|i| i as i16).collect())
         }
+
+        fn set_speed(&self, _speed: f32) {}
     }
 
     // --- Helper to generate unique socket paths ---
@@ -373,12 +432,13 @@ mod tests {
         loop {
             let msg = read_server_msg(&mut client_r).unwrap();
             match msg {
+                ServerMsg::Text(_) => {} // display text (AI: ...)
                 ServerMsg::TtsAudioChunk(samples) => {
                     assert!(samples.len() <= TTS_CHUNK_SIZE);
                     total_samples.extend_from_slice(&samples);
                 }
                 ServerMsg::TtsEnd => break,
-                other => panic!("Expected TtsAudioChunk or TtsEnd, got {other:?}"),
+                other => panic!("Expected Text, TtsAudioChunk or TtsEnd, got {other:?}"),
             }
         }
 
@@ -428,6 +488,7 @@ mod tests {
         loop {
             let msg = read_server_msg(&mut client_r).unwrap();
             match msg {
+                ServerMsg::Text(_) => {} // display text (AI: ...)
                 ServerMsg::TtsAudioChunk(samples) => {
                     assert!(
                         samples.len() <= TTS_CHUNK_SIZE,
@@ -439,7 +500,7 @@ mod tests {
                     total_samples.extend_from_slice(&samples);
                 }
                 ServerMsg::TtsEnd => break,
-                other => panic!("Expected TtsAudioChunk or TtsEnd, got {other:?}"),
+                other => panic!("Expected Text, TtsAudioChunk or TtsEnd, got {other:?}"),
             }
         }
 
@@ -648,12 +709,15 @@ mod tests {
             Ok(msg) => panic!("Should not receive message during pause, got {msg:?}"),
         }
 
-        // TTS during pause → only TtsEnd
+        // TTS during pause → only TtsEnd (may be preceded by stale display text from step 1)
         write_orchestrator_msg(&mut orch_w, &OrchestratorMsg::ResponseText("Skip".into())).unwrap();
-        let msg = read_server_msg(&mut client_r).unwrap();
-        match msg {
-            ServerMsg::TtsEnd => {}
-            other => panic!("Expected TtsEnd during pause, got {other:?}"),
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {} // consume pending display texts
+                ServerMsg::TtsEnd => break,
+                other => panic!("Expected Text or TtsEnd during pause, got {other:?}"),
+            }
         }
 
         // 3. Resume: audio flows again
@@ -676,9 +740,10 @@ mod tests {
         loop {
             let msg = read_server_msg(&mut client_r).unwrap();
             match msg {
+                ServerMsg::Text(_) => {} // display text (AI: ...)
                 ServerMsg::TtsAudioChunk(_) => got_audio = true,
                 ServerMsg::TtsEnd => break,
-                other => panic!("Expected TtsAudioChunk or TtsEnd, got {other:?}"),
+                other => panic!("Expected Text, TtsAudioChunk or TtsEnd, got {other:?}"),
             }
         }
         assert!(got_audio, "Should receive TTS audio after resume");
@@ -750,5 +815,30 @@ mod tests {
         // Cleanup
         drop(mock_orch);
         std::fs::remove_file(&sock_path).ok();
+    }
+
+    // --- Speed marker parsing tests ---
+
+    #[test]
+    fn parse_speed_marker_with_valid_marker() {
+        let (speed, text) = parse_speed_marker("[SPEED:0.6] Sure, I will speak more slowly.");
+        assert_eq!(speed, Some(0.6));
+        assert_eq!(text, "Sure, I will speak more slowly.");
+    }
+
+    #[test]
+    fn parse_speed_marker_without_marker() {
+        let (speed, text) = parse_speed_marker("Hello, how are you?");
+        assert_eq!(speed, None);
+        assert_eq!(text, "Hello, how are you?");
+    }
+
+    #[test]
+    fn parse_speed_marker_with_different_speeds() {
+        let (speed, _) = parse_speed_marker("[SPEED:1.2] Fast speech");
+        assert_eq!(speed, Some(1.2));
+
+        let (speed, _) = parse_speed_marker("[SPEED:0.5] Very slow");
+        assert_eq!(speed, Some(0.5));
     }
 }
