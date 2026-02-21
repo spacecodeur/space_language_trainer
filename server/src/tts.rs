@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use space_lt_common::debug;
 
 /// Trait abstracting TTS synthesis. Returns 16kHz mono i16 samples.
-pub trait TtsEngine: Send {
+pub trait TtsEngine: Send + Sync {
     fn synthesize(&self, text: &str) -> Result<Vec<i16>>;
     fn set_speed(&self, speed: f32);
 }

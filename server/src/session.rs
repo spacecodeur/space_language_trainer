@@ -79,6 +79,7 @@ pub fn run_session(
             )
         })?;
 
+    let tts: Arc<dyn TtsEngine> = Arc::from(tts);
     let tts_handle = std::thread::Builder::new()
         .name("tts_router".into())
         .spawn(move || {
@@ -194,7 +195,7 @@ fn stt_router(
 fn tts_router(
     unix_read: UnixStream,
     client_writer: Arc<Mutex<BufWriter<TcpStream>>>,
-    tts: Box<dyn TtsEngine>,
+    tts: Arc<dyn TtsEngine>,
     paused: Arc<AtomicBool>,
     tts_interrupted: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -247,39 +248,123 @@ fn tts_router(
                 }
 
                 let tts_start = std::time::Instant::now();
+                let sentences = split_sentences(clean_text);
 
-                match tts.synthesize(clean_text) {
-                    Ok(samples) => {
-                        let synth_elapsed = tts_start.elapsed();
-                        let audio_duration = samples.len() as f64 / 16000.0;
-                        info!(
-                            "[server] TTS synthesis: {:.2}s for {:.2}s of audio ({} chars)",
-                            synth_elapsed.as_secs_f64(),
-                            audio_duration,
-                            clean_text.len()
-                        );
-                        let mut w = client_writer
-                            .lock()
-                            .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
-                        let was_interrupted = send_tts_audio(&mut *w, &samples, &tts_interrupted)?;
-                        if was_interrupted {
+                if sentences.is_empty() {
+                    let mut w = client_writer
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                    write_server_msg(&mut *w, &ServerMsg::TtsEnd)?;
+                } else if sentences.len() == 1 {
+                    // Single sentence: no pipeline overhead
+                    match tts.synthesize(sentences[0]) {
+                        Ok(samples) => {
+                            let audio_duration = samples.len() as f64 / 16000.0;
                             info!(
-                                "[server] TTS interrupted after {:.2}s",
-                                tts_start.elapsed().as_secs_f64()
+                                "[server] TTS: {:.2}s synthesis, {:.2}s audio ({} chars)",
+                                tts_start.elapsed().as_secs_f64(),
+                                audio_duration,
+                                clean_text.len()
                             );
-                        } else {
-                            info!(
-                                "[server] TTS total (synthesis + send): {:.2}s",
-                                tts_start.elapsed().as_secs_f64()
-                            );
+                            let mut w = client_writer
+                                .lock()
+                                .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                            let was_interrupted =
+                                send_tts_audio(&mut *w, &samples, &tts_interrupted)?;
+                            if was_interrupted {
+                                info!(
+                                    "[server] TTS interrupted after {:.2}s",
+                                    tts_start.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[server] TTS synthesis failed: {e}");
+                            let mut w = client_writer
+                                .lock()
+                                .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                            write_server_msg(&mut *w, &ServerMsg::TtsEnd)?;
                         }
                     }
-                    Err(e) => {
-                        warn!("[server] TTS synthesis failed: {e}");
+                } else {
+                    // Multiple sentences: pipeline synthesis + send
+                    let num_sentences = sentences.len();
+                    info!(
+                        "[server] TTS streaming: {} sentences for {} chars",
+                        num_sentences,
+                        clean_text.len()
+                    );
+                    let (tx, rx) = crossbeam_channel::bounded::<Vec<i16>>(2);
+                    let tts_clone = tts.clone();
+                    let interrupted_producer = tts_interrupted.clone();
+                    let sentence_strs: Vec<String> =
+                        sentences.iter().map(|s| s.to_string()).collect();
+
+                    // Producer: synthesize sentences sequentially
+                    std::thread::Builder::new()
+                        .name("tts_synth".into())
+                        .spawn(move || {
+                            for (i, sentence) in sentence_strs.iter().enumerate() {
+                                if interrupted_producer.load(Ordering::SeqCst) {
+                                    debug!("[server] TTS producer: interrupted before sentence {}", i + 1);
+                                    break;
+                                }
+                                let synth_start = std::time::Instant::now();
+                                match tts_clone.synthesize(sentence) {
+                                    Ok(samples) => {
+                                        let audio_dur = samples.len() as f64 / 16000.0;
+                                        debug!(
+                                            "[server] TTS sentence {}/{}: {:.2}s synthesis, {} samples ({:.2}s audio)",
+                                            i + 1,
+                                            sentence_strs.len(),
+                                            synth_start.elapsed().as_secs_f64(),
+                                            samples.len(),
+                                            audio_dur,
+                                        );
+                                        if tx.send(samples).is_err() {
+                                            break; // consumer dropped
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[server] TTS synthesis failed for sentence {}/{}: {e}",
+                                            i + 1,
+                                            sentence_strs.len()
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(tx); // signal end of production
+                        })?;
+
+                    // Consumer: send each sentence's audio as it arrives
+                    let mut was_interrupted = false;
+                    {
                         let mut w = client_writer
                             .lock()
                             .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                        for samples in rx {
+                            was_interrupted = send_tts_chunks(&mut *w, &samples, &tts_interrupted)?;
+                            if was_interrupted {
+                                break;
+                            }
+                        }
                         write_server_msg(&mut *w, &ServerMsg::TtsEnd)?;
+                    }
+
+                    if was_interrupted {
+                        info!(
+                            "[server] TTS streaming interrupted after {:.2}s",
+                            tts_start.elapsed().as_secs_f64()
+                        );
+                    } else {
+                        info!(
+                            "[server] TTS streaming complete: {:.2}s ({} sentences, {} chars)",
+                            tts_start.elapsed().as_secs_f64(),
+                            num_sentences,
+                            clean_text.len()
+                        );
                     }
                 }
             }
@@ -312,6 +397,58 @@ fn parse_speed_marker(text: &str) -> (Option<f32>, &str) {
     (None, text)
 }
 
+/// Split text into sentences for streaming TTS synthesis.
+///
+/// Sentences are split on `.` `!` `?` followed by whitespace or end-of-string.
+/// Punctuation stays attached to the preceding sentence (important for TTS intonation).
+/// Empty segments are skipped.
+fn split_sentences(text: &str) -> Vec<&str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if (b == b'.' || b == b'!' || b == b'?')
+            && (i + 1 == bytes.len() || bytes[i + 1].is_ascii_whitespace())
+        {
+            let sentence = text[start..=i].trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            start = i + 1;
+        }
+    }
+
+    // Remaining text after last sentence-ending punctuation
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        sentences.push(tail);
+    }
+
+    sentences
+}
+
+/// Send TTS audio chunks without TtsEnd. Returns `true` if interrupted.
+/// Caller is responsible for sending TtsEnd.
+fn send_tts_chunks(
+    writer: &mut impl Write,
+    samples: &[i16],
+    interrupted: &AtomicBool,
+) -> Result<bool> {
+    for chunk in samples.chunks(TTS_CHUNK_SIZE) {
+        if interrupted.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+        write_server_msg(writer, &ServerMsg::TtsAudioChunk(chunk.to_vec()))?;
+    }
+    Ok(false)
+}
+
 /// Chunk TTS audio samples and send as TtsAudioChunk messages, followed by TtsEnd.
 /// Returns `true` if interrupted mid-stream, `false` if completed normally.
 fn send_tts_audio(
@@ -319,16 +456,12 @@ fn send_tts_audio(
     samples: &[i16],
     interrupted: &AtomicBool,
 ) -> Result<bool> {
-    for chunk in samples.chunks(TTS_CHUNK_SIZE) {
-        if interrupted.load(Ordering::SeqCst) {
-            info!("[server] TTS streaming interrupted — aborting remaining chunks");
-            write_server_msg(writer, &ServerMsg::TtsEnd)?;
-            return Ok(true);
-        }
-        write_server_msg(writer, &ServerMsg::TtsAudioChunk(chunk.to_vec()))?;
+    let was_interrupted = send_tts_chunks(writer, samples, interrupted)?;
+    if was_interrupted {
+        info!("[server] TTS streaming interrupted — aborting remaining chunks");
     }
     write_server_msg(writer, &ServerMsg::TtsEnd)?;
-    Ok(false)
+    Ok(was_interrupted)
 }
 
 #[cfg(test)]
@@ -1058,5 +1191,433 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let msg = read_server_msg(&mut cursor).unwrap();
         assert!(matches!(msg, ServerMsg::TtsEnd));
+    }
+
+    // --- Sentence splitting tests ---
+
+    #[test]
+    fn split_sentences_multiple() {
+        assert_eq!(
+            split_sentences("Hello. How are you? I'm fine!"),
+            vec!["Hello.", "How are you?", "I'm fine!"]
+        );
+    }
+
+    #[test]
+    fn split_sentences_single() {
+        assert_eq!(
+            split_sentences("Just one sentence"),
+            vec!["Just one sentence"]
+        );
+    }
+
+    #[test]
+    fn split_sentences_single_with_period() {
+        assert_eq!(
+            split_sentences("Just one sentence."),
+            vec!["Just one sentence."]
+        );
+    }
+
+    #[test]
+    fn split_sentences_empty() {
+        let result: Vec<&str> = split_sentences("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn split_sentences_whitespace_only() {
+        let result: Vec<&str> = split_sentences("   ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn split_sentences_extra_spaces() {
+        assert_eq!(
+            split_sentences("Hello.  Extra  spaces.  "),
+            vec!["Hello.", "Extra  spaces."]
+        );
+    }
+
+    #[test]
+    fn split_sentences_mixed_punctuation() {
+        assert_eq!(
+            split_sentences("Really? Yes! OK."),
+            vec!["Really?", "Yes!", "OK."]
+        );
+    }
+
+    #[test]
+    fn split_sentences_no_space_after_period() {
+        // Period not followed by whitespace — not a sentence boundary
+        assert_eq!(
+            split_sentences("Version 3.5 is out"),
+            vec!["Version 3.5 is out"]
+        );
+    }
+
+    #[test]
+    fn split_sentences_trailing_no_punctuation() {
+        assert_eq!(
+            split_sentences("First sentence. And then more"),
+            vec!["First sentence.", "And then more"]
+        );
+    }
+
+    // --- Sentence-level mock TTS for streaming tests ---
+
+    /// Mock TTS that produces `samples_per_char * text.len()` samples.
+    /// This simulates sentence-level streaming: shorter sentences → fewer samples.
+    struct SentenceMockTtsEngine {
+        samples_per_char: usize,
+    }
+
+    impl SentenceMockTtsEngine {
+        fn new(samples_per_char: usize) -> Self {
+            Self { samples_per_char }
+        }
+    }
+
+    impl TtsEngine for SentenceMockTtsEngine {
+        fn synthesize(&self, text: &str) -> anyhow::Result<Vec<i16>> {
+            let count = self.samples_per_char * text.len();
+            Ok((0..count).map(|i| i as i16).collect())
+        }
+
+        fn set_speed(&self, _speed: f32) {}
+    }
+
+    fn setup_sentence_session(
+        transcriber_text: &str,
+        samples_per_char: usize,
+    ) -> (
+        TcpStream,
+        UnixStream,
+        String,
+        std::thread::JoinHandle<Result<()>>,
+    ) {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        let sock_path = temp_socket_path();
+        let unix_listener = UnixListener::bind(&sock_path).unwrap();
+
+        let mock_client = TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+        let (server_tcp, _) = tcp_listener.accept().unwrap();
+
+        let mock_orch = UnixStream::connect(&sock_path).unwrap();
+        let (server_unix, _) = unix_listener.accept().unwrap();
+
+        let text = transcriber_text.to_string();
+        let session_handle = std::thread::spawn(move || {
+            run_session(
+                Box::new(MockTranscriber::new(&text)),
+                Box::new(SentenceMockTtsEngine::new(samples_per_char)),
+                server_tcp,
+                server_unix,
+            )
+        });
+
+        (mock_client, mock_orch, sock_path, session_handle)
+    }
+
+    // --- Streaming pipeline integration tests ---
+
+    #[test]
+    fn streaming_multi_sentence_sends_all_audio() {
+        let (mock_client, mock_orch, sock_path, session_handle) =
+            setup_sentence_session("ignored", 100);
+
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // "Hi. Bye." = 2 sentences, each ~4 chars = 400 samples each
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText("Hi. Bye.".into()),
+        )
+        .unwrap();
+
+        let mut total_samples = 0;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {}
+                ServerMsg::TtsAudioChunk(samples) => total_samples += samples.len(),
+                ServerMsg::TtsEnd => break,
+                other => panic!("Unexpected: {other:?}"),
+            }
+        }
+
+        // "Hi." = 3 chars * 100 = 300 samples, "Bye." = 4 chars * 100 = 400 samples
+        assert_eq!(total_samples, 700);
+
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn streaming_single_sentence_same_as_batch() {
+        let (mock_client, mock_orch, sock_path, session_handle) =
+            setup_sentence_session("ignored", 100);
+
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // Single sentence (no trailing period) → single-sentence path
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText("Hello world".into()),
+        )
+        .unwrap();
+
+        let mut total_samples = 0;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {}
+                ServerMsg::TtsAudioChunk(samples) => total_samples += samples.len(),
+                ServerMsg::TtsEnd => break,
+                other => panic!("Unexpected: {other:?}"),
+            }
+        }
+
+        // "Hello world" = 11 chars * 100 = 1100 samples
+        assert_eq!(total_samples, 1100);
+
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn streaming_interrupt_stops_remaining_sentences() {
+        // Use large samples_per_char to make chunks slower, improving interrupt window
+        let (mock_client, mock_orch, sock_path, session_handle) =
+            setup_sentence_session("ignored", 2000);
+
+        let mut client_w = BufWriter::new(mock_client.try_clone().unwrap());
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // 3 sentences with lots of samples each
+        // "First sentence. Second sentence. Third sentence." → 3 sentences
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText(
+                "First sentence. Second sentence. Third sentence.".into(),
+            ),
+        )
+        .unwrap();
+
+        // Read messages until we get audio, then interrupt
+        let mut chunk_count = 0;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {}
+                ServerMsg::TtsAudioChunk(_) => {
+                    chunk_count += 1;
+                    if chunk_count == 1 {
+                        // Interrupt after first chunk
+                        write_client_msg(&mut client_w, &ClientMsg::InterruptTts).unwrap();
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                ServerMsg::TtsEnd => break,
+                other => panic!("Unexpected: {other:?}"),
+            }
+        }
+
+        // Total audio without interrupt would be:
+        // "First sentence." (16 chars) * 2000 = 32000 → 8 chunks
+        // "Second sentence." (17 chars) * 2000 = 34000 → ~9 chunks
+        // "Third sentence." (16 chars) * 2000 = 32000 → 8 chunks
+        // Total: ~25 chunks
+        // With interrupt after first chunk, should be significantly fewer
+        assert!(
+            chunk_count < 25,
+            "Expected fewer chunks due to interrupt, got {chunk_count}"
+        );
+
+        drop(client_w);
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    // --- Pipeline error handling tests ---
+
+    /// Mock TTS that fails on the Nth call (0-indexed).
+    struct FailingMockTtsEngine {
+        samples_per_char: usize,
+        fail_on_call: usize,
+        call_count: Mutex<usize>,
+    }
+
+    impl FailingMockTtsEngine {
+        fn new(samples_per_char: usize, fail_on_call: usize) -> Self {
+            Self {
+                samples_per_char,
+                fail_on_call,
+                call_count: Mutex::new(0),
+            }
+        }
+    }
+
+    impl TtsEngine for FailingMockTtsEngine {
+        fn synthesize(&self, text: &str) -> anyhow::Result<Vec<i16>> {
+            let mut count = self.call_count.lock().unwrap();
+            let current = *count;
+            *count += 1;
+            drop(count);
+
+            if current == self.fail_on_call {
+                anyhow::bail!("TTS synthesis failed on call {current}");
+            }
+            let n = self.samples_per_char * text.len();
+            Ok((0..n).map(|i| i as i16).collect())
+        }
+
+        fn set_speed(&self, _speed: f32) {}
+    }
+
+    fn setup_failing_session(
+        fail_on_call: usize,
+    ) -> (
+        TcpStream,
+        UnixStream,
+        String,
+        std::thread::JoinHandle<Result<()>>,
+    ) {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        let sock_path = temp_socket_path();
+        let unix_listener = UnixListener::bind(&sock_path).unwrap();
+
+        let mock_client = TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+        let (server_tcp, _) = tcp_listener.accept().unwrap();
+
+        let mock_orch = UnixStream::connect(&sock_path).unwrap();
+        let (server_unix, _) = unix_listener.accept().unwrap();
+
+        let session_handle = std::thread::spawn(move || {
+            run_session(
+                Box::new(MockTranscriber::new("ignored")),
+                Box::new(FailingMockTtsEngine::new(100, fail_on_call)),
+                server_tcp,
+                server_unix,
+            )
+        });
+
+        (mock_client, mock_orch, sock_path, session_handle)
+    }
+
+    #[test]
+    fn streaming_error_on_second_sentence_preserves_first() {
+        // Fail on call 1 (second sentence) — first sentence audio should be preserved
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_failing_session(1);
+
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // 3 sentences: first synthesizes OK, second fails, third never attempted
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText("First OK. Second fails. Third never.".into()),
+        )
+        .unwrap();
+
+        let mut total_samples = 0;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {}
+                ServerMsg::TtsAudioChunk(samples) => total_samples += samples.len(),
+                ServerMsg::TtsEnd => break, // TtsEnd received — error didn't prevent it
+                other => panic!("Unexpected: {other:?}"),
+            }
+        }
+
+        // "First OK." = 9 chars * 100 = 900 samples (first sentence delivered)
+        assert_eq!(total_samples, 900);
+
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn streaming_error_on_first_sentence_sends_tts_end() {
+        // Fail on call 0 (first sentence) — no audio, but TtsEnd must be sent
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_failing_session(0);
+
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText("Fails immediately. Never reached.".into()),
+        )
+        .unwrap();
+
+        let mut total_samples = 0;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::Text(_) => {}
+                ServerMsg::TtsAudioChunk(samples) => total_samples += samples.len(),
+                ServerMsg::TtsEnd => break, // TtsEnd received despite all sentences failing
+                other => panic!("Unexpected: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            total_samples, 0,
+            "No audio should be sent on first-sentence error"
+        );
+
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    // --- send_tts_chunks tests ---
+
+    #[test]
+    fn send_tts_chunks_no_tts_end() {
+        let interrupted = AtomicBool::new(false);
+        let samples: Vec<i16> = (0..8000).map(|i| i as i16).collect();
+        let mut buf = Vec::new();
+
+        let was_interrupted = send_tts_chunks(&mut buf, &samples, &interrupted).unwrap();
+        assert!(!was_interrupted);
+
+        // Should contain 2 TtsAudioChunk messages, NO TtsEnd
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut chunk_count = 0;
+        loop {
+            match read_server_msg(&mut cursor) {
+                Ok(ServerMsg::TtsAudioChunk(_)) => chunk_count += 1,
+                Ok(other) => panic!("Expected TtsAudioChunk only, got {other:?}"),
+                Err(_) => break, // EOF
+            }
+        }
+        assert_eq!(chunk_count, 2);
     }
 }

@@ -18,3 +18,4 @@ rubato = "1.0.1"
 audioadapter-buffers = "2.0.0"
 hound = "3.5.1"
 sherpa-rs = { version = "0.6.8", default-features = false, features = ["tts"] }
+crossbeam-channel = "0.5.15"
