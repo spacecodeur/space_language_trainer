@@ -77,7 +77,13 @@ pub fn start_playback(audio_rx: Receiver<Vec<i16>>) -> Result<(cpal::Stream, u32
                             }
                         }
                         Err(_) => {
-                            // No data available — fill remainder with silence
+                            // No data available — fill remainder with silence (self-healing)
+                            if offset > 0 {
+                                // Buffer underrun: started writing audio but ran out mid-callback
+                                space_lt_common::debug!(
+                                    "[client] Playback buffer underrun, filling with silence"
+                                );
+                            }
                             data[offset..].fill(0);
                             break;
                         }

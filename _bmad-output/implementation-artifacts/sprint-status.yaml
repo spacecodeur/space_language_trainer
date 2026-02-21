@@ -48,24 +48,24 @@ development_status:
   epic-1-retrospective: optional
 
   # Epic 2: End-to-End Voice Conversation
-  epic-2: in-progress
+  epic-2: done
   2-1-orchestrator-claude-cli-bridge: done
   2-2-tts-engine-integration: done
   2-3-server-dual-listeners-and-message-routing: done
   2-4-client-tcp-connection-and-audio-playback: done
-  2-5-voice-loop-and-end-to-end-integration: backlog
+  2-5-voice-loop-and-end-to-end-integration: done
   epic-2-retrospective: optional
 
   # Epic 3: Session Control & Robustness
-  epic-3: backlog
-  3-1-hotkey-pause-resume: backlog
-  3-2-hotkey-configuration-and-session-end: backlog
-  3-3-claude-cli-retry-and-audio-error-recovery: backlog
+  epic-3: done
+  3-1-hotkey-pause-resume: done
+  3-2-hotkey-configuration-and-session-end: done
+  3-3-claude-cli-retry-and-audio-error-recovery: done
   epic-3-retrospective: optional
 
   # Epic 4: Intelligent Language Coaching
-  epic-4: backlog
-  4-1-core-language-coaching-persona-and-real-time-feedback: backlog
+  epic-4: in-progress
+  4-1-core-language-coaching-persona-and-real-time-feedback: ready-for-dev
   4-2-deferred-feedback-and-scenario-handling: backlog
   4-3-initial-level-assessment-and-focus-suggestions: backlog
   epic-4-retrospective: optional

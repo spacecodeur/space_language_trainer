@@ -10,6 +10,11 @@ pub struct CaptureConfig {
     pub channels: u16,
 }
 
+/// Maximum number of attempts to start the audio capture stream.
+const CAPTURE_MAX_ATTEMPTS: u32 = 3;
+/// Delay between capture stream retry attempts.
+const CAPTURE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub fn start_capture(
     device: &cpal::Device,
     sender: Sender<Vec<i16>>,
@@ -23,30 +28,59 @@ pub fn start_capture(
 
     let stream_config: cpal::StreamConfig = config.into();
 
-    let err_fn = |err: cpal::StreamError| {
-        warn!("Audio stream error: {err}");
-    };
+    for attempt in 1..=CAPTURE_MAX_ATTEMPTS {
+        let sender_clone = sender.clone();
 
-    let stream = device
-        .build_input_stream(
-            &stream_config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let _ = sender.try_send(data.to_vec());
+        let build_result = device
+            .build_input_stream(
+                &stream_config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let _ = sender_clone.try_send(data.to_vec());
+                },
+                |err: cpal::StreamError| {
+                    warn!("[client] Audio stream error: {err}");
+                },
+                None,
+            )
+            .context("building input stream");
+
+        match build_result {
+            Ok(stream) => match stream.play() {
+                Ok(()) => {
+                    return Ok((
+                        stream,
+                        CaptureConfig {
+                            sample_rate,
+                            channels,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    let err = anyhow::anyhow!("starting audio stream: {e}");
+                    if attempt < CAPTURE_MAX_ATTEMPTS {
+                        warn!(
+                            "[client] Audio capture attempt {attempt}/{CAPTURE_MAX_ATTEMPTS} failed: {err}, retrying..."
+                        );
+                        std::thread::sleep(CAPTURE_RETRY_DELAY);
+                    } else {
+                        return Err(err);
+                    }
+                }
             },
-            err_fn,
-            None,
-        )
-        .context("Failed to build input stream")?;
+            Err(e) => {
+                if attempt < CAPTURE_MAX_ATTEMPTS {
+                    warn!(
+                        "[client] Audio capture attempt {attempt}/{CAPTURE_MAX_ATTEMPTS} failed: {e}, retrying..."
+                    );
+                    std::thread::sleep(CAPTURE_RETRY_DELAY);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
 
-    stream.play().context("Failed to start audio stream")?;
-
-    Ok((
-        stream,
-        CaptureConfig {
-            sample_rate,
-            channels,
-        },
-    ))
+    unreachable!("loop always returns or errors")
 }
 
 pub type ResamplerFn = Box<dyn FnMut(&[i16]) -> Vec<i16>>;

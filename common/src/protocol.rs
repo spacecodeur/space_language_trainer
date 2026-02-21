@@ -45,6 +45,15 @@ pub enum OrchestratorMsg {
     SessionEnd,              // tag 0xA3, empty payload
 }
 
+// --- Server-to-Orchestrator messages (read by orchestrator, combines server + orchestrator tags) ---
+
+#[derive(Debug)]
+pub enum ServerOrcMsg {
+    Ready,                   // tag 0x80, empty payload
+    Error(String),           // tag 0x82, payload = UTF-8
+    TranscribedText(String), // tag 0xA0, payload = UTF-8
+}
+
 // --- Wire format: [tag: u8][length: u32 LE][payload] ---
 
 pub fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> Result<()> {
@@ -265,6 +274,41 @@ pub fn read_orchestrator_msg(r: &mut impl Read) -> Result<OrchestratorMsg> {
             Ok(OrchestratorMsg::SessionEnd)
         }
         other => bail!("Unknown orchestrator message tag: 0x{other:02x}"),
+    }
+}
+
+/// Read a server-to-orchestrator message from the Unix socket.
+///
+/// Handles tags from both ServerMsg (0x80 Ready, 0x82 Error) and
+/// OrchestratorMsg (0xA0 TranscribedText) since the server writes
+/// both types on the same Unix socket stream.
+pub fn read_server_orc_msg(r: &mut impl Read) -> Result<ServerOrcMsg> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    match tag[0] {
+        0x80 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ServerOrcMsg::Ready)
+        }
+        0x82 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(ServerOrcMsg::Error(String::from_utf8(payload)?))
+        }
+        0xA0 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(ServerOrcMsg::TranscribedText(String::from_utf8(payload)?))
+        }
+        other => bail!("Unknown server-to-orchestrator message tag: 0x{other:02x}"),
     }
 }
 
@@ -617,6 +661,54 @@ mod tests {
     }
 
     // --- is_disconnect tests ---
+
+    // --- ServerOrcMsg tests ---
+
+    #[test]
+    fn read_server_orc_msg_ready() {
+        // write_server_msg produces tag 0x80 — read_server_orc_msg should parse it
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::Ready).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ServerOrcMsg::Ready));
+    }
+
+    #[test]
+    fn read_server_orc_msg_error() {
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::Error("oops".into())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        match msg {
+            ServerOrcMsg::Error(e) => assert_eq!(e, "oops"),
+            other => panic!("Expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_server_orc_msg_transcribed_text() {
+        // Server writes TranscribedText via write_orchestrator_msg (tag 0xA0)
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::TranscribedText("hello".into()))
+            .unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        match msg {
+            ServerOrcMsg::TranscribedText(t) => assert_eq!(t, "hello"),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_server_orc_msg_unknown_tag() {
+        let buf = vec![0xB0, 0, 0, 0, 0]; // unknown tag
+        let mut cursor = Cursor::new(buf);
+        assert!(read_server_orc_msg(&mut cursor).is_err());
+    }
 
     #[test]
     fn is_disconnect_detects_unexpected_eof() {

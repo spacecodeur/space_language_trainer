@@ -47,26 +47,76 @@ impl LlmBackend for MockLlmBackend {
     }
 }
 
-/// Real Claude CLI backend. Spawns `claude -p` per turn.
+/// Mock backend that fails a configurable number of times before returning responses.
+/// Used for testing retry and error recovery logic.
+#[cfg(test)]
+pub struct FailingMockLlmBackend {
+    fail_count: AtomicUsize,
+    responses: Vec<String>,
+    call_index: AtomicUsize,
+}
+
+#[cfg(test)]
+impl FailingMockLlmBackend {
+    pub fn new(fail_count: usize, responses: Vec<String>) -> Self {
+        Self {
+            fail_count: AtomicUsize::new(fail_count),
+            responses,
+            call_index: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LlmBackend for FailingMockLlmBackend {
+    fn query(
+        &self,
+        _prompt: &str,
+        _system_prompt_file: &Path,
+        _continue_session: bool,
+    ) -> Result<String> {
+        let remaining = self.fail_count.load(Ordering::Relaxed);
+        if remaining > 0 {
+            self.fail_count.fetch_sub(1, Ordering::Relaxed);
+            bail!("Simulated LLM failure");
+        }
+        if self.responses.is_empty() {
+            bail!("FailingMockLlmBackend has no responses configured");
+        }
+        let i = self.call_index.fetch_add(1, Ordering::Relaxed);
+        Ok(self.responses[i % self.responses.len()].clone())
+    }
+}
+
+/// Real Claude CLI backend. Spawns `claude -p` per turn with timeout and retry.
 pub struct ClaudeCliBackend {
     session_dir: std::path::PathBuf,
 }
+
+/// Maximum number of retry attempts for Claude CLI queries.
+const MAX_RETRIES: u32 = 3;
+/// Delay between retry attempts.
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Timeout for a single Claude CLI invocation.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Predefined error message sent to user via TTS when all retries fail.
+const ERROR_FALLBACK: &str =
+    "I'm sorry, I'm having trouble connecting right now. Please try again in a moment.";
 
 impl ClaudeCliBackend {
     pub fn new(session_dir: std::path::PathBuf) -> Self {
         Self { session_dir }
     }
-}
 
-impl LlmBackend for ClaudeCliBackend {
-    fn query(
+    /// Execute a single Claude CLI query with a 30-second timeout.
+    fn query_once(
         &self,
         prompt: &str,
         system_prompt_file: &Path,
         continue_session: bool,
     ) -> Result<String> {
         use space_lt_common::debug;
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::process::{Command, Stdio};
 
         debug!(
@@ -100,21 +150,54 @@ impl LlmBackend for ClaudeCliBackend {
             // stdin drops here, closing the pipe
         }
 
-        let output = child.wait_with_output()?;
+        // Read stdout/stderr in background threads (they block until process exits)
+        let stdout_pipe = child.stdout.take().unwrap();
+        let stderr_pipe = child.stderr.take().unwrap();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "Claude CLI exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            std::io::BufReader::new(stdout_pipe)
+                .read_to_string(&mut buf)
+                .ok();
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            std::io::BufReader::new(stderr_pipe)
+                .read_to_string(&mut buf)
+                .ok();
+            buf
+        });
+
+        // Poll child with try_wait() + timeout deadline
+        let deadline = std::time::Instant::now() + QUERY_TIMEOUT;
+        let status = loop {
+            match child.try_wait().context("polling Claude CLI process")? {
+                Some(status) => break status,
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait(); // reap zombie
+                        bail!("Claude CLI timed out after {}s", QUERY_TIMEOUT.as_secs());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        };
+
+        // Collect output from reader threads
+        let stdout_str = stdout_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout reader thread panicked"))?;
+        let stderr_str = stderr_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr reader thread panicked"))?;
+
+        if !status.success() {
+            bail!("Claude CLI exited with {}: {}", status, stderr_str.trim());
         }
 
-        let response =
-            String::from_utf8(output.stdout).context("Claude CLI output is not valid UTF-8")?;
-
-        let trimmed = response.trim().to_string();
+        let trimmed = stdout_str.trim().to_string();
         if trimmed.is_empty() {
             bail!("Claude CLI returned empty response");
         }
@@ -125,6 +208,37 @@ impl LlmBackend for ClaudeCliBackend {
         );
 
         Ok(trimmed)
+    }
+}
+
+impl LlmBackend for ClaudeCliBackend {
+    fn query(
+        &self,
+        prompt: &str,
+        system_prompt_file: &Path,
+        continue_session: bool,
+    ) -> Result<String> {
+        use space_lt_common::{info, warn};
+
+        // NOTE: if continue_session=true and a previous attempt was killed mid-response,
+        // the Claude CLI session file may be in an inconsistent state. The retry with
+        // --continue might fail for that reason. This is a known limitation.
+        for attempt in 1..=MAX_RETRIES {
+            match self.query_once(prompt, system_prompt_file, continue_session) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    warn!("[orchestrator] Claude CLI attempt {attempt}/{MAX_RETRIES} failed: {e}");
+                    if attempt < MAX_RETRIES {
+                        info!("[orchestrator] Retrying in {}s...", RETRY_DELAY.as_secs());
+                        std::thread::sleep(RETRY_DELAY);
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted — return error fallback (NOT Err)
+        warn!("[orchestrator] All {MAX_RETRIES} Claude CLI attempts failed, sending error to user");
+        Ok(ERROR_FALLBACK.to_string())
     }
 }
 
@@ -158,5 +272,28 @@ mod tests {
         let backend = MockLlmBackend::new(vec![]);
         let result = backend.query("Hi", &PathBuf::from("agent.md"), false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn failing_mock_fails_then_succeeds() {
+        let backend = FailingMockLlmBackend::new(2, vec!["Success".to_string()]);
+        let p = PathBuf::from("agent.md");
+
+        // First two calls fail
+        assert!(backend.query("1", &p, false).is_err());
+        assert!(backend.query("2", &p, true).is_err());
+
+        // Third call succeeds
+        let result = backend.query("3", &p, true).unwrap();
+        assert_eq!(result, "Success");
+    }
+
+    #[test]
+    fn failing_mock_immediate_success_when_zero_failures() {
+        let backend = FailingMockLlmBackend::new(0, vec!["OK".to_string()]);
+        let p = PathBuf::from("agent.md");
+
+        let result = backend.query("1", &p, false).unwrap();
+        assert_eq!(result, "OK");
     }
 }

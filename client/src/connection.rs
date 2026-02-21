@@ -3,14 +3,18 @@ use std::io::{BufReader, BufWriter};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use space_lt_common::info;
 use space_lt_common::protocol::{ServerMsg, read_server_msg};
+use space_lt_common::{info, warn};
 
 // Re-export from common for use by main.rs
 pub use space_lt_common::protocol::is_disconnect;
 
 /// Connect timeout for TCP connection attempts.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum reconnection attempts with exponential backoff.
+const MAX_CONNECT_ATTEMPTS: u32 = 3;
+/// Exponential backoff delays in seconds (1s, 2s, 4s).
+const BACKOFF_SECS: [u64; 3] = [1, 2, 4];
 
 /// TCP connection to the server, replacing the old SSH-based RemoteTranscriber.
 pub struct TcpConnection {
@@ -51,6 +55,33 @@ impl TcpConnection {
         }
 
         Ok(conn)
+    }
+
+    /// Connect with exponential backoff retry (1s, 2s, 4s), max 3 attempts.
+    ///
+    /// Useful when the server may not be ready at client startup, or after a
+    /// TCP connection drop.
+    pub fn connect_with_retry(addr: &str) -> Result<Self> {
+        let mut last_err = None;
+        for attempt in 1..=MAX_CONNECT_ATTEMPTS {
+            if attempt > 1 {
+                let delay = BACKOFF_SECS[attempt as usize - 2];
+                info!("[client] Retrying in {delay}s...");
+                std::thread::sleep(Duration::from_secs(delay));
+            }
+            match Self::connect(addr) {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    warn!(
+                        "[client] Connection attempt {attempt}/{MAX_CONNECT_ATTEMPTS} failed: {e:#}"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap()
+            .context("all TCP connection attempts failed"))
     }
 
     /// Read the next server message.
@@ -110,6 +141,30 @@ mod tests {
 
         let result = TcpConnection::connect(&format!("127.0.0.1:{port}"));
         assert!(result.is_err());
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn connect_with_retry_succeeds_on_second_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_handle = std::thread::spawn(move || {
+            // First connection: send Error (client will retry)
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = StdBufWriter::new(stream);
+            write_server_msg(&mut writer, &ServerMsg::Error("not ready".into())).unwrap();
+            drop(writer);
+
+            // Second connection: send Ready (client succeeds)
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = StdBufWriter::new(stream);
+            write_server_msg(&mut writer, &ServerMsg::Ready).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let conn = TcpConnection::connect_with_retry(&format!("127.0.0.1:{port}")).unwrap();
+        drop(conn);
         server_handle.join().unwrap();
     }
 

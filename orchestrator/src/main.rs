@@ -1,9 +1,16 @@
 mod claude;
+mod connection;
+mod voice_loop;
 
 use anyhow::Result;
+use std::net::Shutdown;
 
 use claude::{ClaudeCliBackend, LlmBackend, MockLlmBackend};
-use space_lt_common::{debug, info};
+use connection::OrchestratorConnection;
+use space_lt_common::info;
+use space_lt_common::protocol::{OrchestratorMsg, write_orchestrator_msg};
+
+const DEFAULT_SOCKET_PATH: &str = "/tmp/space_lt_server.sock";
 
 fn find_arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
@@ -21,7 +28,7 @@ fn main() -> Result<()> {
 
     let agent_file = find_arg_value(&args, "--agent").ok_or_else(|| {
         anyhow::anyhow!(
-            "Usage: space_lt_orchestrator --agent <path> [--session-dir <path>] [--mock] [--debug]"
+            "Usage: space_lt_orchestrator --agent <path> [--socket <path>] [--session-dir <path>] [--mock] [--debug]"
         )
     })?;
     let agent_path = std::path::PathBuf::from(&agent_file);
@@ -29,6 +36,9 @@ fn main() -> Result<()> {
     if !agent_path.exists() {
         anyhow::bail!("Agent file not found: {agent_file}");
     }
+
+    let socket_path =
+        find_arg_value(&args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string());
 
     let session_dir = match find_arg_value(&args, "--session-dir") {
         Some(dir) => {
@@ -49,6 +59,13 @@ fn main() -> Result<()> {
 
     let use_mock = args.iter().any(|a| a == "--mock");
 
+    // Build config JSON before session_dir is moved
+    let config_json = format!(
+        r#"{{"agent_file": "{}", "session_dir": "{}"}}"#,
+        agent_path.display(),
+        session_dir.display()
+    );
+
     let backend: Box<dyn LlmBackend> = if use_mock {
         info!("[orchestrator] Using mock backend");
         Box::new(MockLlmBackend::new(vec![
@@ -62,39 +79,28 @@ fn main() -> Result<()> {
         Box::new(ClaudeCliBackend::new(session_dir))
     };
 
-    info!("[orchestrator] Ready. Type text and press Enter (Ctrl+D to quit).");
+    // Connect to server via Unix socket
+    let mut conn = OrchestratorConnection::connect(&socket_path)?;
 
-    let stdin = std::io::stdin();
-    let mut first_turn = true;
+    // Set up Ctrl+C handler: shutdown stream to unblock voice loop reader
+    let shutdown_stream = conn.try_clone_stream()?;
 
-    loop {
-        let mut line = String::new();
-        let bytes_read = stdin.read_line(&mut line)?;
-        if bytes_read == 0 {
-            // EOF
-            break;
-        }
+    ctrlc::set_handler(move || {
+        info!("[orchestrator] Ctrl+C received, shutting down...");
+        let _ = shutdown_stream.shutdown(Shutdown::Both);
+    })?;
 
-        let prompt = line.trim();
-        if prompt.is_empty() {
-            continue;
-        }
+    // Session start handshake
+    conn.send_session_start(&config_json)?;
 
-        debug!(
-            "[orchestrator] Sending prompt ({} chars, continue={})",
-            prompt.len(),
-            !first_turn
-        );
+    // Run voice loop
+    let (mut reader, mut writer) = conn.into_split();
+    voice_loop::run_voice_loop(&mut reader, &mut writer, backend.as_ref(), &agent_path)?;
 
-        match backend.query(prompt, &agent_path, !first_turn) {
-            Ok(response) => {
-                println!("{response}");
-                first_turn = false;
-            }
-            Err(e) => {
-                eprintln!("[orchestrator] Error: {e}");
-            }
-        }
+    // Attempt to send SessionEnd on exit (succeeds on normal exit; on Ctrl+C the
+    // stream is already closed so this will fail — server detects disconnect instead)
+    if let Err(e) = write_orchestrator_msg(&mut writer, &OrchestratorMsg::SessionEnd) {
+        space_lt_common::debug!("[orchestrator] Could not send SessionEnd: {e}");
     }
 
     info!("[orchestrator] Session ended.");

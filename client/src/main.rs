@@ -67,9 +67,9 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     info!("  Device:  {}", config.device_name);
     info!("  Hotkey:  {:?}", config.hotkey);
 
-    // 2. TCP connect + Ready handshake
+    // 2. TCP connect + Ready handshake (with exponential backoff retry)
     info!("Connecting to server...");
-    let conn = connection::TcpConnection::connect(&server_addr)?;
+    let conn = connection::TcpConnection::connect_with_retry(&server_addr)?;
     let shutdown_stream = conn.try_clone_stream()?;
     let (reader, writer) = conn.into_split();
 
@@ -127,13 +127,31 @@ fn run_client(server_override: Option<String>) -> Result<()> {
 
         if was_listening && !listening {
             voice_detector.reset();
-            info!("[PAUSED]");
+            if let Err(e) = write_client_msg(&mut writer, &ClientMsg::PauseRequest) {
+                warn!("[client] Failed to send PauseRequest: {e}");
+                if is_disconnect(&e) {
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+            } else {
+                info!("[client] Sent PauseRequest");
+                info!("[PAUSED]");
+            }
             debug!("  (processed {listening_chunks} audio chunks while listening)");
             listening_chunks = 0;
         }
 
         if !was_listening && listening {
-            info!("[LISTENING]");
+            if let Err(e) = write_client_msg(&mut writer, &ClientMsg::ResumeRequest) {
+                warn!("[client] Failed to send ResumeRequest: {e}");
+                if is_disconnect(&e) {
+                    shutdown.store(true, Ordering::SeqCst);
+                    break;
+                }
+            } else {
+                info!("[client] Sent ResumeRequest");
+                info!("[LISTENING]");
+            }
             listening_chunks = 0;
         }
 

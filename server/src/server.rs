@@ -3,7 +3,9 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use space_lt_common::info;
-use space_lt_common::protocol::{ServerMsg, write_server_msg};
+use space_lt_common::protocol::{
+    OrchestratorMsg, ServerMsg, read_orchestrator_msg, write_server_msg,
+};
 
 use crate::listener;
 use crate::session;
@@ -46,6 +48,23 @@ pub fn run_daemon(
         .accept()
         .context("accepting Unix socket orchestrator connection")?;
     info!("[server] Orchestrator connected");
+
+    // SessionStart handshake: read SessionStart, send Ready back on Unix socket.
+    // Use raw stream (not BufReader) to avoid read-ahead stealing bytes from the fd
+    // that run_session's BufReaders would then miss.
+    let msg = read_orchestrator_msg(&mut &unix_stream)
+        .context("reading SessionStart from orchestrator")?;
+    match msg {
+        OrchestratorMsg::SessionStart(config) => {
+            info!("[server] SessionStart received: {config}");
+        }
+        other => {
+            anyhow::bail!("Expected SessionStart from orchestrator, got {other:?}");
+        }
+    }
+
+    write_server_msg(&mut &unix_stream, &ServerMsg::Ready)?;
+    info!("[server] Sent Ready to orchestrator");
 
     info!("[server] Starting session routing...");
     session::run_session(transcriber, tts, tcp_stream, unix_stream)?;

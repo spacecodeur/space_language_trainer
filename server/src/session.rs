@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use space_lt_common::protocol::{
@@ -48,13 +50,18 @@ pub fn run_session(
     // tcp_stream → writer for tts_router, tcp_for_read → reader for stt_router
     // unix_stream → writer for stt_router, unix_for_read → reader for tts_router
 
+    // Shared pause state between stt_router and tts_router
+    let paused = Arc::new(AtomicBool::new(false));
+    let paused_stt = paused.clone();
+    let paused_tts = paused;
+
     let stt_handle = std::thread::Builder::new()
         .name("stt_router".into())
-        .spawn(move || stt_router(tcp_for_read, unix_stream, transcriber))?;
+        .spawn(move || stt_router(tcp_for_read, unix_stream, transcriber, paused_stt))?;
 
     let tts_handle = std::thread::Builder::new()
         .name("tts_router".into())
-        .spawn(move || tts_router(unix_for_read, tcp_stream, tts))?;
+        .spawn(move || tts_router(unix_for_read, tcp_stream, tts, paused_tts))?;
 
     // Wait for either thread to finish (connection close or error)
     loop {
@@ -89,6 +96,7 @@ fn stt_router(
     tcp_read: TcpStream,
     unix_write: UnixStream,
     mut transcriber: Box<dyn Transcriber>,
+    paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut reader = BufReader::new(tcp_read);
     let mut writer = BufWriter::new(unix_write);
@@ -107,6 +115,14 @@ fn stt_router(
 
         match msg {
             ClientMsg::AudioSegment(samples) => {
+                if paused.load(Ordering::SeqCst) {
+                    debug!(
+                        "[server] Paused — dropping audio segment ({} samples)",
+                        samples.len()
+                    );
+                    continue;
+                }
+
                 debug!(
                     "[server] Audio segment: {} samples ({:.0}ms)",
                     samples.len(),
@@ -123,10 +139,12 @@ fn stt_router(
                 }
             }
             ClientMsg::PauseRequest => {
-                debug!("[server] PauseRequest received (not yet implemented)");
+                paused.store(true, Ordering::SeqCst);
+                info!("[server] Session paused");
             }
             ClientMsg::ResumeRequest => {
-                debug!("[server] ResumeRequest received (not yet implemented)");
+                paused.store(false, Ordering::SeqCst);
+                info!("[server] Session resumed");
             }
         }
     }
@@ -135,7 +153,12 @@ fn stt_router(
 }
 
 /// TTS routing: reads OrchestratorMsg from Unix, synthesizes speech, streams to client.
-fn tts_router(unix_read: UnixStream, tcp_write: TcpStream, tts: Box<dyn TtsEngine>) -> Result<()> {
+fn tts_router(
+    unix_read: UnixStream,
+    tcp_write: TcpStream,
+    tts: Box<dyn TtsEngine>,
+    paused: Arc<AtomicBool>,
+) -> Result<()> {
     let mut reader = BufReader::new(unix_read);
     let mut writer = BufWriter::new(tcp_write);
 
@@ -153,6 +176,15 @@ fn tts_router(unix_read: UnixStream, tcp_write: TcpStream, tts: Box<dyn TtsEngin
 
         match msg {
             OrchestratorMsg::ResponseText(text) => {
+                if paused.load(Ordering::SeqCst) {
+                    debug!(
+                        "[server] Paused — skipping TTS for response ({} chars)",
+                        text.len()
+                    );
+                    write_server_msg(&mut writer, &ServerMsg::TtsEnd)?;
+                    continue;
+                }
+
                 debug!("[server] ResponseText: {} chars", text.len());
 
                 match tts.synthesize(&text) {
@@ -166,7 +198,6 @@ fn tts_router(unix_read: UnixStream, tcp_write: TcpStream, tts: Box<dyn TtsEngin
                     }
                     Err(e) => {
                         warn!("[server] TTS synthesis failed: {e}");
-                        // Send empty TtsEnd to signal the client that this response is done
                         write_server_msg(&mut writer, &ServerMsg::TtsEnd)?;
                     }
                 }
@@ -175,13 +206,11 @@ fn tts_router(unix_read: UnixStream, tcp_write: TcpStream, tts: Box<dyn TtsEngin
                 debug!("[server] Unexpected TranscribedText from orchestrator (ignoring)");
             }
             OrchestratorMsg::SessionStart(json) => {
-                debug!(
-                    "[server] SessionStart received (not yet implemented): {}",
-                    json
-                );
+                debug!("[server] SessionStart in tts_router (unexpected): {}", json);
             }
             OrchestratorMsg::SessionEnd => {
-                debug!("[server] SessionEnd received (not yet implemented)");
+                info!("[server] SessionEnd received, stopping session");
+                break;
             }
         }
     }
@@ -421,6 +450,297 @@ mod tests {
         drop(mock_client);
         drop(mock_orch);
         let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    // --- Pause/Resume tests ---
+
+    /// Helper: set up a session with TCP + Unix connections, returning handles for test interaction.
+    fn setup_session(
+        transcriber_text: &str,
+        tts_samples: usize,
+    ) -> (
+        TcpStream,  // mock client
+        UnixStream, // mock orchestrator
+        String,     // socket path
+        std::thread::JoinHandle<Result<()>>,
+    ) {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        let sock_path = temp_socket_path();
+        let unix_listener = UnixListener::bind(&sock_path).unwrap();
+
+        let mock_client = TcpStream::connect(("127.0.0.1", tcp_port)).unwrap();
+        let (server_tcp, _) = tcp_listener.accept().unwrap();
+
+        let mock_orch = UnixStream::connect(&sock_path).unwrap();
+        let (server_unix, _) = unix_listener.accept().unwrap();
+
+        let text = transcriber_text.to_string();
+        let session_handle = std::thread::spawn(move || {
+            run_session(
+                Box::new(MockTranscriber::new(&text)),
+                Box::new(MockTtsEngine::new(tts_samples)),
+                server_tcp,
+                server_unix,
+            )
+        });
+
+        (mock_client, mock_orch, sock_path, session_handle)
+    }
+
+    #[test]
+    fn pause_drops_audio_segments() {
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("Hello", 8000);
+
+        let mut client_w = BufWriter::new(mock_client.try_clone().unwrap());
+        let orch_clone = mock_orch.try_clone().unwrap();
+        orch_clone
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut orch_r = BufReader::new(orch_clone);
+
+        // 1. Normal: send audio → orchestrator receives TranscribedText
+        write_client_msg(&mut client_w, &ClientMsg::AudioSegment(vec![0; 1600])).unwrap();
+        let msg = read_orchestrator_msg(&mut orch_r).unwrap();
+        match msg {
+            OrchestratorMsg::TranscribedText(t) => assert_eq!(t, "Hello"),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+
+        // 2. Pause
+        write_client_msg(&mut client_w, &ClientMsg::PauseRequest).unwrap();
+        // Small delay for pause to take effect
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 3. Send audio during pause → orchestrator should NOT receive anything
+        write_client_msg(&mut client_w, &ClientMsg::AudioSegment(vec![0; 1600])).unwrap();
+        match read_orchestrator_msg(&mut orch_r) {
+            Err(e) => {
+                let is_timeout = e.downcast_ref::<std::io::Error>().map_or(false, |io| {
+                    io.kind() == std::io::ErrorKind::WouldBlock
+                        || io.kind() == std::io::ErrorKind::TimedOut
+                });
+                assert!(is_timeout, "Expected timeout, got error: {e}");
+            }
+            Ok(msg) => panic!("Should not receive message during pause, got {msg:?}"),
+        }
+
+        // Cleanup
+        drop(client_w);
+        drop(orch_r);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn resume_restores_audio_forwarding() {
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("Resumed", 8000);
+
+        let mut client_w = BufWriter::new(mock_client.try_clone().unwrap());
+        let mut orch_r = BufReader::new(mock_orch.try_clone().unwrap());
+
+        // 1. Pause
+        write_client_msg(&mut client_w, &ClientMsg::PauseRequest).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 2. Resume
+        write_client_msg(&mut client_w, &ClientMsg::ResumeRequest).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 3. Send audio → orchestrator should receive TranscribedText again
+        write_client_msg(&mut client_w, &ClientMsg::AudioSegment(vec![0; 1600])).unwrap();
+        let msg = read_orchestrator_msg(&mut orch_r).unwrap();
+        match msg {
+            OrchestratorMsg::TranscribedText(t) => assert_eq!(t, "Resumed"),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+
+        // Cleanup
+        drop(client_w);
+        drop(orch_r);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn pause_skips_tts_with_tts_end() {
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("ignored", 8000);
+
+        let mut client_w = BufWriter::new(mock_client.try_clone().unwrap());
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // 1. Pause the session
+        write_client_msg(&mut client_w, &ClientMsg::PauseRequest).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 2. Orchestrator sends ResponseText while paused
+        write_orchestrator_msg(
+            &mut orch_w,
+            &OrchestratorMsg::ResponseText("Skipped".into()),
+        )
+        .unwrap();
+
+        // 3. Client should receive TtsEnd only (no TtsAudioChunk)
+        let msg = read_server_msg(&mut client_r).unwrap();
+        match msg {
+            ServerMsg::TtsEnd => {} // Expected: immediate TtsEnd, no audio chunks
+            other => panic!("Expected TtsEnd during pause, got {other:?}"),
+        }
+
+        // Cleanup
+        drop(client_w);
+        drop(client_r);
+        drop(orch_w);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn full_pause_resume_cycle() {
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("Cycle", 4000);
+
+        let mut client_w = BufWriter::new(mock_client.try_clone().unwrap());
+        let mut client_r = BufReader::new(mock_client.try_clone().unwrap());
+        let orch_clone = mock_orch.try_clone().unwrap();
+        orch_clone
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut orch_r = BufReader::new(orch_clone);
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+
+        // 1. Normal: audio flows through
+        write_client_msg(&mut client_w, &ClientMsg::AudioSegment(vec![0; 1600])).unwrap();
+        let msg = read_orchestrator_msg(&mut orch_r).unwrap();
+        match msg {
+            OrchestratorMsg::TranscribedText(t) => assert_eq!(t, "Cycle"),
+            other => panic!("Expected TranscribedText, got {other:?}"),
+        }
+
+        // 2. Pause: audio dropped, TTS skipped
+        write_client_msg(&mut client_w, &ClientMsg::PauseRequest).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        write_client_msg(&mut client_w, &ClientMsg::AudioSegment(vec![0; 1600])).unwrap();
+        match read_orchestrator_msg(&mut orch_r) {
+            Err(e) => {
+                let is_timeout = e.downcast_ref::<std::io::Error>().map_or(false, |io| {
+                    io.kind() == std::io::ErrorKind::WouldBlock
+                        || io.kind() == std::io::ErrorKind::TimedOut
+                });
+                assert!(is_timeout, "Expected timeout during pause, got: {e}");
+            }
+            Ok(msg) => panic!("Should not receive message during pause, got {msg:?}"),
+        }
+
+        // TTS during pause → only TtsEnd
+        write_orchestrator_msg(&mut orch_w, &OrchestratorMsg::ResponseText("Skip".into())).unwrap();
+        let msg = read_server_msg(&mut client_r).unwrap();
+        match msg {
+            ServerMsg::TtsEnd => {}
+            other => panic!("Expected TtsEnd during pause, got {other:?}"),
+        }
+
+        // 3. Resume: audio flows again
+        write_client_msg(&mut client_w, &ClientMsg::ResumeRequest).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        write_client_msg(&mut client_w, &ClientMsg::AudioSegment(vec![0; 1600])).unwrap();
+
+        // Reset read timeout for resumed operation
+        orch_r.get_ref().set_read_timeout(None).unwrap();
+        let msg = read_orchestrator_msg(&mut orch_r).unwrap();
+        match msg {
+            OrchestratorMsg::TranscribedText(t) => assert_eq!(t, "Cycle"),
+            other => panic!("Expected TranscribedText after resume, got {other:?}"),
+        }
+
+        // TTS after resume → normal audio chunks
+        write_orchestrator_msg(&mut orch_w, &OrchestratorMsg::ResponseText("Play".into())).unwrap();
+        let mut got_audio = false;
+        loop {
+            let msg = read_server_msg(&mut client_r).unwrap();
+            match msg {
+                ServerMsg::TtsAudioChunk(_) => got_audio = true,
+                ServerMsg::TtsEnd => break,
+                other => panic!("Expected TtsAudioChunk or TtsEnd, got {other:?}"),
+            }
+        }
+        assert!(got_audio, "Should receive TTS audio after resume");
+
+        // Cleanup
+        drop(client_w);
+        drop(client_r);
+        drop(orch_w);
+        drop(orch_r);
+        drop(mock_client);
+        drop(mock_orch);
+        let _ = session_handle.join();
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    // --- Session End tests ---
+
+    #[test]
+    fn session_end_stops_session() {
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("test", 4000);
+
+        // Orchestrator sends SessionEnd
+        let mut orch_w = BufWriter::new(mock_orch.try_clone().unwrap());
+        write_orchestrator_msg(&mut orch_w, &OrchestratorMsg::SessionEnd).unwrap();
+        drop(orch_w);
+
+        // Session should end cleanly (join with timeout via mpsc channel)
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<()>>();
+        std::thread::spawn(move || {
+            let result = session_handle
+                .join()
+                .expect("session thread should not panic");
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("session should end within 5 seconds");
+        assert!(result.is_ok(), "session should end cleanly on SessionEnd");
+
+        // Cleanup
+        drop(mock_client);
+        drop(mock_orch);
+        std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn client_disconnect_ends_session() {
+        let (mock_client, mock_orch, sock_path, session_handle) = setup_session("test", 4000);
+
+        // Client disconnects (close TCP)
+        drop(mock_client);
+
+        // Session should end cleanly
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<()>>();
+        std::thread::spawn(move || {
+            let result = session_handle
+                .join()
+                .expect("session thread should not panic");
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("session should end within 5 seconds");
+        assert!(
+            result.is_ok(),
+            "session should end cleanly on client disconnect"
+        );
+
+        // Cleanup
+        drop(mock_orch);
         std::fs::remove_file(&sock_path).ok();
     }
 }
