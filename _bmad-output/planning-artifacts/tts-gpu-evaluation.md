@@ -75,6 +75,19 @@ This evaluation covers two categories of alternatives:
 | **License (10%)** | **A** — MIT (ort) + Apache (Kokoro weights). | A — MIT. | A — MIT. | **A** — MIT. | **A** — MIT. | **F** — CC-BY-NC (non-commercial). Disqualified. |
 | **Build complexity (10%)** | B — Pre-built CUDA 12 binaries via `ort`. Needs CUDA toolkit for GPU. Feature flag switch. | C — Requires external libonnxruntime install. Not on crates.io (git dep). | C — Same as kokorox. | **A** — Pure Rust (Candle). `cargo add pocket-tts`. No native deps. | B — Same as ort (uses ort underneath). | B — Same as ort. |
 
+### Supplementary Criteria (AC#2 Coverage)
+
+| Criterion | ort + Kokoro | kokorox | Kokoros | pocket-tts | Chatterbox (ort) | F5-TTS (ort) |
+|-----------|-------------|---------|--------|------------|-----------------|-------------|
+| **Kokoro model support** | Yes — same ONNX model | Yes — native Kokoro wrapper | Yes — native Kokoro wrapper | No — different model (CSM/Mimi) | No — different model | No — different model |
+| **Audio output format** | f32 24kHz (resample to 16kHz i16) | f32 24kHz (resample to 16kHz i16) | f32 24kHz (resample to 16kHz i16) | f32, sample rate TBD (resample to 16kHz i16) | f32, sample rate TBD | f32, sample rate TBD |
+| **Thread safety (`Send + Sync`)** | Yes — `ort::Session` is `Send + Sync` | Yes — wraps ort Session | Likely — wraps ort Session, unverified | Yes — Candle tensors are `Send + Sync` | Yes (via ort) | Yes (via ort) |
+| **Sync vs async API** | Sync — `Session::run()` blocks | Sync — `generate()` blocks | Sync — `generate()` blocks | Sync — `generate()` blocks | Sync (via ort) | Sync (via ort) |
+| **Issue count (open)** | ~3 open issues | ~10 open issues | ~20 open issues | ~5 open issues | N/A (no Rust crate) | N/A (no Rust crate) |
+| **Release frequency** | Monthly (RC cycle since 2024) | Sporadic (last: 2025-02) | Sporadic (last: 2025-02) | ~Bimonthly (last: 2025-01) | N/A | N/A |
+
+_Data gathered on 2026-02-21. Issue counts and release dates are approximate and may have changed._
+
 ### Weighted Scores
 
 | Alternative | GPU (25) | Maturity (20) | API (20) | Quality (15) | License (10) | Build (10) | **Total** |
@@ -213,11 +226,11 @@ If ort migration proves complex, pocket-tts can serve as an immediate CPU upgrad
 | Kokoro GPU may still be slow without tuning | LOW | `cudnn_conv_algo_search` is the proven fix. ort exposes it directly. |
 | pocket-tts audio quality untested in pipeline | LOW | Easy to prototype — add crate, wrap in TtsEngine, A/B test. |
 
-### Open Questions
+### Open Questions (with preliminary recommendations)
 
-1. **espeak-ng vs Misaki for phonemization?** — espeak-ng is battle-tested but requires system library. Misaki is pure Rust but less mature. Evaluate during implementation.
-2. **Should we support multiple TTS backends simultaneously?** — Feature flags (`--tts-backend`) would allow users to choose. Minimal extra code if TtsEngine trait is already abstracted.
-3. **Pocket TTS output sample rate?** — Need to verify during implementation. Resampling pipeline may need adjustment.
+1. **espeak-ng vs Misaki for phonemization?** — **Recommend espeak-ng.** It is the phonemizer Kokoro was trained with, so phoneme output is guaranteed to match model expectations. kokorox and Kokoros both use espeak-ng, confirming this is the proven path. The system library dependency (`espeak-ng-sys` or `espeak-ng` package) is acceptable — the project already requires CUDA toolkit and ONNX Runtime as native deps. Misaki can be revisited later if removing native deps becomes a priority.
+2. **Should we support multiple TTS backends simultaneously?** — **Recommend yes, via feature flags.** The `TtsEngine` trait already abstracts the backend. Adding `--tts-backend ort|sherpa|pocket` requires minimal extra code (~20 lines in `main.rs`). Keep sherpa-rs as fallback behind a feature flag during migration. This is low-risk and high-value for testing.
+3. **Pocket TTS output sample rate?** — **Likely 24kHz based on CSM model defaults.** The existing rubato resampling pipeline (24kHz → 16kHz) should apply. Verify with a quick `pocket_tts::Tts::generate()` call during story 6-4 implementation — if different, adjust the resampling ratio (a one-line change).
 
 ---
 

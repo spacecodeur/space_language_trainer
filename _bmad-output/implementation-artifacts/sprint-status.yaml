@@ -81,5 +81,5 @@ development_status:
   epic-6: in-progress
   6-1-barge-in-interruption: done
   6-2-streaming-tts-pipeline: done
-  6-3-tts-gpu-alternatives-evaluation: review
+  6-3-tts-gpu-alternatives-evaluation: done
   epic-6-retrospective: optional

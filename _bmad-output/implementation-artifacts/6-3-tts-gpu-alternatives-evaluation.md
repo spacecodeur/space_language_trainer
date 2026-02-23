@@ -1,6 +1,6 @@
 # Story 6.3: TTS GPU Alternatives Evaluation
 
-Status: review
+Status: done
 
 ## Story
 
@@ -45,7 +45,7 @@ So that I can make an informed decision on which alternative to implement in the
 - [x] Task 2: Define evaluation criteria and build comparison matrix (AC: #2)
   - [x] 2.1: Define weighted criteria (GPU perf, maturity, API fit, build complexity, maintenance risk)
   - [x] 2.2: Evaluate each alternative against criteria
-  - [x] 2.3: Run quick feasibility checks where possible (e.g., `cargo add` + compile test in isolated branch)
+  - [x] 2.3: Run quick feasibility checks where possible (e.g., `cargo add` + compile test in isolated branch) — _Note: No compile tests were run. Feasibility was assessed via documentation review (API signatures, trait bounds, dependency graphs) rather than `cargo add` tests. The research-only constraint (AC#5: no code changes) made isolated branch testing impractical within this story's scope._
   - [x] 2.4: Produce comparison matrix table
 
 - [x] Task 3: Assess migration effort per alternative (AC: #3)
@@ -200,6 +200,11 @@ N/A (research-only story, no code changes)
 
 ### Change Log
 - `_bmad-output/planning-artifacts/tts-gpu-evaluation.md` — Created evaluation document (deliverable)
+- `_bmad-output/implementation-artifacts/sprint-status.yaml` — Updated story 6-3 status to review
+- `_bmad-output/implementation-artifacts/6-3-tts-gpu-alternatives-evaluation.md` — Story file (self)
+- Code review (2026-02-23): Added supplementary AC#2 criteria table, resolved open questions with preliminary recommendations, clarified Task 2.3 note
 
 ### File List
 - `_bmad-output/planning-artifacts/tts-gpu-evaluation.md` (CREATED — research deliverable)
+- `_bmad-output/implementation-artifacts/sprint-status.yaml` (MODIFIED — sprint tracking update)
+- `_bmad-output/implementation-artifacts/6-3-tts-gpu-alternatives-evaluation.md` (MODIFIED — story file)
