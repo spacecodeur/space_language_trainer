@@ -36,6 +36,9 @@ Summarize grammar topics discussed (tenses, prepositions, articles, etc.) with b
 ### Session Highlights
 What the user did well, topics covered, and suggested focus areas for next time.
 
+### New Zealand — Practical Info
+If during the session any practical information about New Zealand was discussed (visa, work permits, job market, housing, cost of living, cultural tips, administrative steps, IT industry specifics, daily life, etc.), summarize the key takeaways here. Focus on what is actionable for a French IT professional relocating to NZ. If no NZ-related practical info was discussed, omit this section entirely.
+
 Output ONLY the markdown content. No preamble, no closing remarks. Do not wrap the output in a code block."#;
 
 /// Voice loop state (for logging).

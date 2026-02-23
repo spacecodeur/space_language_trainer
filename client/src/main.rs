@@ -321,7 +321,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
             if let Err(e) = write_client_msg(&mut writer, &ClientMsg::SummaryRequest) {
                 warn!("[client] Failed to send SummaryRequest: {e}");
             } else {
-                match summary_rx.recv_timeout(Duration::from_secs(60)) {
+                match summary_rx.recv() {
                     Ok(summary) => match save_summary(&summary) {
                         Ok(path) => {
                             info!("Session summary saved to: {}", path.display());
@@ -331,7 +331,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                         }
                     },
                     Err(_) => {
-                        warn!("[client] Summary generation timed out (60s)");
+                        warn!("[client] Summary channel closed before receiving response");
                     }
                 }
             }
