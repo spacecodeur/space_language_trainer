@@ -84,4 +84,5 @@ development_status:
   6-3-tts-gpu-alternatives-evaluation: done
   6-4-migrate-tts-to-ort-kokoro: ready-for-dev
   6-5-visual-language-feedback: review
+  6-6-session-summary-generation: ready-for-dev
   epic-6-retrospective: optional
