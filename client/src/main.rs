@@ -491,7 +491,7 @@ fn classify_feedback_line(line: &str) -> Option<(&str, &str)> {
         }
     }
     // Known soft-suggestion prefixes → blue
-    for prefix in ["BLUE:", "YELLOW:", "GREEN:"] {
+    for prefix in ["BLUE:", "YELLOW:"] {
         if let Some(rest) = line.strip_prefix(prefix) {
             return Some(("blue", rest.trim()));
         }
@@ -510,16 +510,101 @@ fn classify_feedback_line(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Parse a corrected sentence, splitting on `<<` and `>>` delimiters.
+///
+/// Returns a vec of `(is_corrected, text)` segments.
+/// - Text between `<<` and `>>` is marked as corrected (`true`).
+/// - Text outside delimiters is unmarked (`false`).
+/// - If no `<<` markers are found, the entire text is returned as `(true, text)` (graceful degradation).
+/// - Empty input returns an empty vec.
+/// - Unmatched `<<` (no closing `>>`) treats remaining text as corrected.
+/// - Stray `>>` without preceding `<<` are treated as literal text.
+fn parse_corrected_parts(text: &str) -> Vec<(bool, &str)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    if !text.contains("<<") {
+        return vec![(true, text)];
+    }
+
+    let mut parts = Vec::new();
+    let mut remaining = text;
+
+    while let Some(open) = remaining.find("<<") {
+        // Text before `<<`
+        let before = &remaining[..open];
+        if !before.is_empty() {
+            parts.push((false, before));
+        }
+        remaining = &remaining[open + 2..];
+
+        // Find closing `>>`
+        if let Some(close) = remaining.find(">>") {
+            let inner = &remaining[..close];
+            if !inner.is_empty() {
+                parts.push((true, inner));
+            }
+            remaining = &remaining[close + 2..];
+        } else {
+            // Unmatched `<<` — treat rest as corrected
+            if !remaining.is_empty() {
+                parts.push((true, remaining));
+            }
+            remaining = "";
+        }
+    }
+
+    // Any remaining text after the last `>>`
+    if !remaining.is_empty() {
+        parts.push((false, remaining));
+    }
+
+    parts
+}
+
+/// Display a corrected sentence line with green-highlighted corrected parts.
+fn display_corrected_line(text: &str) {
+    let trimmed = text.trim();
+    let parts = parse_corrected_parts(trimmed);
+    if parts.is_empty() {
+        return;
+    }
+    eprint!("  \x1b[32m\u{2713}\x1b[0m ");
+    for (is_corrected, segment) in &parts {
+        if *is_corrected {
+            eprint!("\x1b[32m{segment}\x1b[0m");
+        } else {
+            eprint!("{segment}");
+        }
+    }
+    eprintln!("\x1b[0m");
+}
+
 /// Display language feedback with ANSI colors.
 ///
 /// Lines prefixed with `RED:` are shown in red with a cross mark.
 /// Lines prefixed with `BLUE:` are shown in blue with an arrow.
 /// Other color prefixes Claude might invent are mapped to red or blue.
 fn display_feedback(text: &str) {
+    // Extract the LAST CORRECTED: line before the main loop
+    // (must happen before classify_feedback_line to avoid ALLCAPS catch-all)
+    let mut corrected_content: Option<&str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case("CORRECTED:") {
+            corrected_content = Some(trimmed[10..].trim());
+        }
+    }
+
     eprintln!("\x1b[2m--- feedback ---\x1b[0m");
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        // Skip CORRECTED lines (already extracted)
+        if trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case("CORRECTED:") {
             continue;
         }
         let (severity, content) = classify_feedback_line(trimmed).unwrap_or(("blue", trimmed));
@@ -528,6 +613,12 @@ fn display_feedback(text: &str) {
             _ => eprintln!("  \x1b[34m\u{279c} {content}\x1b[0m"),
         }
     }
+
+    // Display corrected sentence last (green ✓)
+    if let Some(content) = corrected_content {
+        display_corrected_line(content);
+    }
+
     eprintln!("\x1b[2m----------------\x1b[0m");
 }
 
@@ -632,5 +723,65 @@ fn tcp_reader_loop(
                 let _ = summary_tx.send(text);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_corrected_parts_with_markers() {
+        let result = parse_corrected_parts("I <<went>> to the store");
+        assert_eq!(
+            result,
+            vec![(false, "I "), (true, "went"), (false, " to the store"),]
+        );
+    }
+
+    #[test]
+    fn parse_corrected_parts_without_markers() {
+        let result = parse_corrected_parts("I went to the store");
+        assert_eq!(result, vec![(true, "I went to the store")]);
+    }
+
+    #[test]
+    fn parse_corrected_parts_multiple_markers() {
+        let result = parse_corrected_parts("I <<went>> to <<the>> store");
+        assert_eq!(
+            result,
+            vec![
+                (false, "I "),
+                (true, "went"),
+                (false, " to "),
+                (true, "the"),
+                (false, " store"),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_corrected_parts_empty() {
+        let result = parse_corrected_parts("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_corrected_parts_unmatched_open() {
+        let result = parse_corrected_parts("I <<went to the store");
+        assert_eq!(result, vec![(false, "I "), (true, "went to the store")]);
+    }
+
+    #[test]
+    fn parse_corrected_parts_adjacent_markers() {
+        let result = parse_corrected_parts("<<foo>><<bar>>");
+        assert_eq!(result, vec![(true, "foo"), (true, "bar")]);
+    }
+
+    #[test]
+    fn parse_corrected_parts_stray_close() {
+        // No `<<` at all, so `>>` is literal — graceful degradation: entire string is (true, ...)
+        let result = parse_corrected_parts("I went>> to the store");
+        assert_eq!(result, vec![(true, "I went>> to the store")]);
     }
 }
