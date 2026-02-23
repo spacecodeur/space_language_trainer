@@ -82,4 +82,5 @@ development_status:
   6-1-barge-in-interruption: done
   6-2-streaming-tts-pipeline: done
   6-3-tts-gpu-alternatives-evaluation: done
+  6-4-migrate-tts-to-ort-kokoro: ready-for-dev
   epic-6-retrospective: optional
