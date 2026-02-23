@@ -23,6 +23,7 @@ pub enum ClientMsg {
     PauseRequest,           // tag 0x02, empty payload
     ResumeRequest,          // tag 0x03, empty payload
     InterruptTts,           // tag 0x04, empty payload
+    FeedbackChoice(bool),   // tag 0x05, payload = 1 byte (0x01=continue, 0x00=retry)
 }
 
 // --- Server messages (server → client, tags 0x80-0xFF) ---
@@ -34,6 +35,7 @@ pub enum ServerMsg {
     Error(String),           // tag 0x82, payload = UTF-8
     TtsAudioChunk(Vec<i16>), // tag 0x83, payload = raw i16 LE bytes
     TtsEnd,                  // tag 0x84, empty payload
+    Feedback(String),        // tag 0x85, payload = UTF-8 (language feedback, not spoken)
 }
 
 // --- Orchestrator messages (orchestrator ↔ server, tags 0xA0-0xBF, Unix socket) ---
@@ -44,6 +46,8 @@ pub enum OrchestratorMsg {
     ResponseText(String),    // tag 0xA1, payload = UTF-8
     SessionStart(String),    // tag 0xA2, payload = UTF-8 JSON (raw string)
     SessionEnd,              // tag 0xA3, empty payload
+    FeedbackText(String),    // tag 0xA4, payload = UTF-8 (language feedback for display)
+    FeedbackChoice(bool),    // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
 }
 
 // --- Server-to-Orchestrator messages (read by orchestrator, combines server + orchestrator tags) ---
@@ -53,6 +57,7 @@ pub enum ServerOrcMsg {
     Ready,                   // tag 0x80, empty payload
     Error(String),           // tag 0x82, payload = UTF-8
     TranscribedText(String), // tag 0xA0, payload = UTF-8
+    FeedbackChoice(bool),    // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
 }
 
 // --- Wire format: [tag: u8][length: u32 LE][payload] ---
@@ -81,6 +86,12 @@ pub fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> Result<()> {
         ClientMsg::InterruptTts => {
             w.write_all(&[0x04])?;
             w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+        ClientMsg::FeedbackChoice(proceed) => {
+            w.write_all(&[0x05])?;
+            w.write_all(&1u32.to_le_bytes())?;
+            w.write_all(&[if *proceed { 0x01 } else { 0x00 }])?;
             w.flush()?;
         }
     }
@@ -129,6 +140,12 @@ pub fn read_client_msg(r: &mut impl Read) -> Result<ClientMsg> {
             }
             Ok(ClientMsg::InterruptTts)
         }
+        0x05 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            let proceed = payload.first().copied().unwrap_or(0x01) != 0x00;
+            Ok(ClientMsg::FeedbackChoice(proceed))
+        }
         other => bail!("Unknown client message tag: 0x{other:02x}"),
     }
 }
@@ -166,6 +183,13 @@ pub fn write_server_msg(w: &mut impl Write, msg: &ServerMsg) -> Result<()> {
         ServerMsg::TtsEnd => {
             w.write_all(&[0x84])?;
             w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+        ServerMsg::Feedback(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0x85])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
             w.flush()?;
         }
     }
@@ -217,6 +241,11 @@ pub fn read_server_msg(r: &mut impl Read) -> Result<ServerMsg> {
             }
             Ok(ServerMsg::TtsEnd)
         }
+        0x85 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(ServerMsg::Feedback(String::from_utf8(payload)?))
+        }
         other => bail!("Unknown server message tag: 0x{other:02x}"),
     }
 }
@@ -247,6 +276,19 @@ pub fn write_orchestrator_msg(w: &mut impl Write, msg: &OrchestratorMsg) -> Resu
         OrchestratorMsg::SessionEnd => {
             w.write_all(&[0xA3])?;
             w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+        OrchestratorMsg::FeedbackText(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0xA4])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
+        OrchestratorMsg::FeedbackChoice(proceed) => {
+            w.write_all(&[0xA5])?;
+            w.write_all(&1u32.to_le_bytes())?;
+            w.write_all(&[if *proceed { 0x01 } else { 0x00 }])?;
             w.flush()?;
         }
     }
@@ -286,6 +328,17 @@ pub fn read_orchestrator_msg(r: &mut impl Read) -> Result<OrchestratorMsg> {
             }
             Ok(OrchestratorMsg::SessionEnd)
         }
+        0xA4 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(OrchestratorMsg::FeedbackText(String::from_utf8(payload)?))
+        }
+        0xA5 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            let proceed = payload.first().copied().unwrap_or(0x01) != 0x00;
+            Ok(OrchestratorMsg::FeedbackChoice(proceed))
+        }
         other => bail!("Unknown orchestrator message tag: 0x{other:02x}"),
     }
 }
@@ -320,6 +373,12 @@ pub fn read_server_orc_msg(r: &mut impl Read) -> Result<ServerOrcMsg> {
             let mut payload = vec![0u8; len];
             r.read_exact(&mut payload)?;
             Ok(ServerOrcMsg::TranscribedText(String::from_utf8(payload)?))
+        }
+        0xA5 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            let proceed = payload.first().copied().unwrap_or(0x01) != 0x00;
+            Ok(ServerOrcMsg::FeedbackChoice(proceed))
         }
         other => bail!("Unknown server-to-orchestrator message tag: 0x{other:02x}"),
     }
@@ -736,6 +795,127 @@ mod tests {
         let buf = vec![0xB0, 0, 0, 0, 0]; // unknown tag
         let mut cursor = Cursor::new(buf);
         assert!(read_server_orc_msg(&mut cursor).is_err());
+    }
+
+    // --- Story 6-5: Feedback message round-trip tests ---
+
+    #[test]
+    fn round_trip_client_feedback_choice_continue() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::FeedbackChoice(true)).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        match msg {
+            ClientMsg::FeedbackChoice(proceed) => assert!(proceed),
+            other => panic!("Expected FeedbackChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_client_feedback_choice_retry() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::FeedbackChoice(false)).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        match msg {
+            ClientMsg::FeedbackChoice(proceed) => assert!(!proceed),
+            other => panic!("Expected FeedbackChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_server_feedback() {
+        let text = "RED: \"I have went\" → \"I went\" (past simple)\nBLUE: \"it is good\" → \"it's appealing\" (more natural)".to_string();
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::Feedback(text.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        match msg {
+            ServerMsg::Feedback(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_server_feedback_empty() {
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::Feedback(String::new())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        match msg {
+            ServerMsg::Feedback(decoded) => assert_eq!(decoded, ""),
+            other => panic!("Expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_orchestrator_feedback_text() {
+        let text = "RED: \"I have went\" → \"I went\" (past simple)".to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::FeedbackText(text.clone())).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::FeedbackText(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected FeedbackText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_orchestrator_feedback_choice_continue() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::FeedbackChoice(true)).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::FeedbackChoice(proceed) => assert!(proceed),
+            other => panic!("Expected FeedbackChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_orchestrator_feedback_choice_retry() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::FeedbackChoice(false)).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::FeedbackChoice(proceed) => assert!(!proceed),
+            other => panic!("Expected FeedbackChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_server_orc_msg_feedback_choice_continue() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::FeedbackChoice(true)).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        match msg {
+            ServerOrcMsg::FeedbackChoice(proceed) => assert!(proceed),
+            other => panic!("Expected FeedbackChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_server_orc_msg_feedback_choice_retry() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::FeedbackChoice(false)).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        match msg {
+            ServerOrcMsg::FeedbackChoice(proceed) => assert!(!proceed),
+            other => panic!("Expected FeedbackChoice, got {other:?}"),
+        }
     }
 
     #[test]

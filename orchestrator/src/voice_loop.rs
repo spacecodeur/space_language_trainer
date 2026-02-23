@@ -13,7 +13,7 @@ use crate::claude::LlmBackend;
 /// Short reminder prepended to every user prompt to reinforce voice output rules.
 /// On --continue turns, Claude may "forget" the system prompt's formatting rules,
 /// especially when using web search. This inline reminder keeps it on track.
-const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max.]\n\n";
+const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max. If you notice grammar errors or unnatural phrasing in the user's message, prepend a [FEEDBACK]...[/FEEDBACK] block before your spoken response.]\n\n";
 
 /// Voice loop state (for logging).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -33,6 +33,29 @@ impl std::fmt::Display for VoiceLoopState {
     }
 }
 
+/// Parse an optional `[FEEDBACK]...[/FEEDBACK]` block from the beginning of a response.
+///
+/// Returns `(Some(feedback_content), remaining_text)` if a valid block is found,
+/// or `(None, original_text)` for graceful degradation (missing tags, malformed, etc.).
+pub fn parse_feedback(text: String) -> (Option<String>, String) {
+    let trimmed = text.trim_start();
+    let Some(after_open) = trimmed.strip_prefix("[FEEDBACK]") else {
+        return (None, text);
+    };
+    let Some(end_idx) = after_open.find("[/FEEDBACK]") else {
+        // Malformed: opening tag but no closing tag — treat entire text as spoken
+        return (None, text);
+    };
+    let feedback = after_open[..end_idx].trim();
+    if feedback.is_empty() {
+        // Empty feedback block — skip it, pass the rest as spoken text
+        let rest = after_open[end_idx + "[/FEEDBACK]".len()..].trim_start();
+        return (None, rest.to_string());
+    }
+    let rest = after_open[end_idx + "[/FEEDBACK]".len()..].trim_start();
+    (Some(feedback.to_string()), rest.to_string())
+}
+
 /// Run the main voice loop: read transcriptions, query LLM, send responses.
 ///
 /// Blocks until the server disconnects or an unrecoverable error occurs.
@@ -44,6 +67,7 @@ pub fn run_voice_loop(
 ) -> Result<()> {
     let mut turn_count: u32 = 0;
     let mut state = VoiceLoopState::WaitingForTranscription;
+    let mut retry_context: Option<String> = None;
 
     loop {
         // 1. Wait for transcribed text from server
@@ -66,6 +90,10 @@ pub fn run_voice_loop(
                 info!("[orchestrator] Unexpected Ready during voice loop");
                 continue;
             }
+            ServerOrcMsg::FeedbackChoice(_) => {
+                warn!("[orchestrator] Unexpected FeedbackChoice outside feedback flow");
+                continue;
+            }
         };
 
         // 2. Query LLM
@@ -76,7 +104,12 @@ pub fn run_voice_loop(
         turn_count += 1;
         info!("[orchestrator] Turn {turn_count}: received '{text}'");
 
-        let augmented_prompt = format!("{FORMAT_REMINDER}{text}");
+        // Prepend retry context if user chose to rephrase on previous turn
+        let augmented_prompt = if let Some(ctx) = retry_context.take() {
+            format!("{FORMAT_REMINDER}{ctx}{text}")
+        } else {
+            format!("{FORMAT_REMINDER}{text}")
+        };
         let query_start = std::time::Instant::now();
 
         let response = match backend.query(&augmented_prompt, agent_path, turn_count > 1) {
@@ -97,7 +130,7 @@ pub fn run_voice_loop(
             }
         };
 
-        // 3. Send response back to server for TTS
+        // 3. Parse feedback and send response
         let prev_state = state;
         state = VoiceLoopState::WaitingForTts;
         info!(
@@ -106,8 +139,60 @@ pub fn run_voice_loop(
         );
         info!("[orchestrator] State: {prev_state} → {state}");
 
-        info!("[orchestrator] Response: '{response}'");
-        write_orchestrator_msg(writer, &OrchestratorMsg::ResponseText(response))?;
+        let (feedback, spoken) = parse_feedback(response);
+
+        if let Some(fb) = feedback {
+            info!("[orchestrator] Feedback detected, sending to client");
+            write_orchestrator_msg(writer, &OrchestratorMsg::FeedbackText(fb))?;
+
+            // Wait for user's choice: continue or retry (ignore stray messages)
+            let feedback_choice = loop {
+                let choice_msg = match read_server_orc_msg(reader) {
+                    Ok(msg) => msg,
+                    Err(e) if is_disconnect(&e) => {
+                        info!(
+                            "[orchestrator] Server disconnected while waiting for feedback choice"
+                        );
+                        break None;
+                    }
+                    Err(e) => return Err(e),
+                };
+                match choice_msg {
+                    ServerOrcMsg::FeedbackChoice(proceed) => break Some(proceed),
+                    other => {
+                        warn!(
+                            "[orchestrator] Ignoring unexpected message while waiting for FeedbackChoice: {other:?}"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            match feedback_choice {
+                Some(true) => {
+                    info!("[orchestrator] User chose to continue");
+                    info!("[orchestrator] Response: '{spoken}'");
+                    write_orchestrator_msg(writer, &OrchestratorMsg::ResponseText(spoken))?;
+                }
+                Some(false) => {
+                    info!("[orchestrator] User chose to retry — skipping response");
+                    retry_context = Some(
+                        "[The user chose to rephrase their previous statement. Their new attempt follows:]\n\n"
+                            .to_string(),
+                    );
+                    state = VoiceLoopState::WaitingForTranscription;
+                    info!("[orchestrator] State: WaitingForTts → {state}");
+                    continue;
+                }
+                None => {
+                    // Server disconnected
+                    break;
+                }
+            }
+        } else {
+            info!("[orchestrator] Response: '{spoken}'");
+            write_orchestrator_msg(writer, &OrchestratorMsg::ResponseText(spoken))?;
+        }
 
         // 4. Back to waiting
         let prev_state = state;
@@ -124,6 +209,68 @@ mod tests {
     use crate::claude::MockLlmBackend;
     use space_lt_common::protocol::{read_orchestrator_msg, write_orchestrator_msg};
     use std::path::PathBuf;
+
+    // --- parse_feedback tests ---
+
+    #[test]
+    fn parse_feedback_with_valid_block() {
+        let input = "[FEEDBACK]\nRED: \"I have went\" → \"I went\" (past simple)\nBLUE: \"it is good\" → \"it's appealing\" (more natural)\n[/FEEDBACK]\nThat sounds great! What else did you do?".to_string();
+        let (fb, spoken) = parse_feedback(input);
+        assert!(fb.is_some());
+        let fb = fb.unwrap();
+        assert!(fb.contains("RED:"));
+        assert!(fb.contains("BLUE:"));
+        assert_eq!(spoken, "That sounds great! What else did you do?");
+    }
+
+    #[test]
+    fn parse_feedback_without_block() {
+        let input = "That sounds great! What else did you do?".to_string();
+        let (fb, spoken) = parse_feedback(input.clone());
+        assert!(fb.is_none());
+        assert_eq!(spoken, input);
+    }
+
+    #[test]
+    fn parse_feedback_empty_block() {
+        let input = "[FEEDBACK]\n[/FEEDBACK]\nThat sounds great!".to_string();
+        let (fb, spoken) = parse_feedback(input);
+        assert!(fb.is_none());
+        assert_eq!(spoken, "That sounds great!");
+    }
+
+    #[test]
+    fn parse_feedback_malformed_no_closing_tag() {
+        let input = "[FEEDBACK]\nRED: something\nThat sounds great!".to_string();
+        let (fb, spoken) = parse_feedback(input.clone());
+        assert!(fb.is_none());
+        assert_eq!(spoken, input);
+    }
+
+    #[test]
+    fn parse_feedback_with_speed_tag_after() {
+        let input = "[FEEDBACK]\nRED: \"I have went\" → \"I went\"\n[/FEEDBACK]\n[SPEED:0.8] That sounds great!".to_string();
+        let (fb, spoken) = parse_feedback(input);
+        assert!(fb.is_some());
+        assert!(fb.unwrap().contains("RED:"));
+        assert_eq!(spoken, "[SPEED:0.8] That sounds great!");
+    }
+
+    #[test]
+    fn parse_feedback_empty_input() {
+        let (fb, spoken) = parse_feedback(String::new());
+        assert!(fb.is_none());
+        assert_eq!(spoken, "");
+    }
+
+    #[test]
+    fn parse_feedback_with_leading_whitespace() {
+        let input = "  \n[FEEDBACK]\nRED: error\n[/FEEDBACK]\nResponse here.".to_string();
+        let (fb, spoken) = parse_feedback(input);
+        assert!(fb.is_some());
+        assert_eq!(fb.unwrap(), "RED: error");
+        assert_eq!(spoken, "Response here.");
+    }
 
     #[test]
     fn voice_loop_processes_transcription_and_sends_response() {
@@ -299,6 +446,150 @@ mod tests {
 
         // Backend fails once, then succeeds
         let backend = FailingMockLlmBackend::new(1, vec!["Normal response".to_string()]);
+        let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(orch_stream);
+        let agent_path = PathBuf::from("agent.md");
+
+        let result = run_voice_loop(&mut reader, &mut writer, &backend, &agent_path);
+        assert!(result.is_ok());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn voice_loop_feedback_continue_sends_response() {
+        let (orch_stream, server_stream) = UnixStream::pair().unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(server_stream);
+
+            // Server sends TranscribedText
+            write_orchestrator_msg(
+                &mut writer,
+                &OrchestratorMsg::TranscribedText("I have went to store".into()),
+            )
+            .unwrap();
+
+            // Server reads FeedbackText (orchestrator parsed it from LLM response)
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            match &msg {
+                OrchestratorMsg::FeedbackText(fb) => assert!(fb.contains("RED:")),
+                other => panic!("Expected FeedbackText, got {other:?}"),
+            }
+
+            // Server sends FeedbackChoice(true) — user chose continue
+            write_orchestrator_msg(&mut writer, &OrchestratorMsg::FeedbackChoice(true)).unwrap();
+
+            // Server reads ResponseText (spoken part only)
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            match msg {
+                OrchestratorMsg::ResponseText(t) => {
+                    assert_eq!(t, "That sounds good! Tell me more.");
+                }
+                other => panic!("Expected ResponseText, got {other:?}"),
+            }
+
+            drop(writer);
+            drop(reader);
+        });
+
+        let backend = MockLlmBackend::new(vec![
+            "[FEEDBACK]\nRED: \"I have went\" → \"I went\" (past simple)\n[/FEEDBACK]\nThat sounds good! Tell me more.".to_string(),
+        ]);
+        let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(orch_stream);
+        let agent_path = PathBuf::from("agent.md");
+
+        let result = run_voice_loop(&mut reader, &mut writer, &backend, &agent_path);
+        assert!(result.is_ok());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn voice_loop_feedback_retry_skips_response_and_waits() {
+        let (orch_stream, server_stream) = UnixStream::pair().unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(server_stream);
+
+            // Turn 1: user speaks with error
+            write_orchestrator_msg(
+                &mut writer,
+                &OrchestratorMsg::TranscribedText("I have went to store".into()),
+            )
+            .unwrap();
+
+            // Server reads FeedbackText
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            assert!(matches!(msg, OrchestratorMsg::FeedbackText(_)));
+
+            // Server sends FeedbackChoice(false) — user chose retry
+            write_orchestrator_msg(&mut writer, &OrchestratorMsg::FeedbackChoice(false)).unwrap();
+
+            // No ResponseText should come — orchestrator waits for next transcription
+
+            // Turn 2: user retries with corrected speech
+            write_orchestrator_msg(
+                &mut writer,
+                &OrchestratorMsg::TranscribedText("I went to the store".into()),
+            )
+            .unwrap();
+
+            // Server reads ResponseText for turn 2 (no feedback this time)
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            match msg {
+                OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Great job! Much better."),
+                other => panic!("Expected ResponseText, got {other:?}"),
+            }
+
+            drop(writer);
+            drop(reader);
+        });
+
+        let backend = MockLlmBackend::new(vec![
+            "[FEEDBACK]\nRED: \"I have went\" → \"I went\"\n[/FEEDBACK]\nNice try!".to_string(),
+            "Great job! Much better.".to_string(),
+        ]);
+        let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(orch_stream);
+        let agent_path = PathBuf::from("agent.md");
+
+        let result = run_voice_loop(&mut reader, &mut writer, &backend, &agent_path);
+        assert!(result.is_ok());
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn voice_loop_no_feedback_sends_response_directly() {
+        // Verify no regression: when there's no feedback block, behavior is identical
+        let (orch_stream, server_stream) = UnixStream::pair().unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(server_stream);
+
+            write_orchestrator_msg(
+                &mut writer,
+                &OrchestratorMsg::TranscribedText("I went to the store yesterday".into()),
+            )
+            .unwrap();
+
+            // Should get ResponseText directly (no FeedbackText)
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            match msg {
+                OrchestratorMsg::ResponseText(t) => assert_eq!(t, "That's great!"),
+                other => panic!("Expected ResponseText, got {other:?}"),
+            }
+
+            drop(writer);
+            drop(reader);
+        });
+
+        let backend = MockLlmBackend::new(vec!["That's great!".to_string()]);
         let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
         let mut writer = BufWriter::new(orch_stream);
         let agent_path = PathBuf::from("agent.md");

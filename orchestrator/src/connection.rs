@@ -51,6 +51,9 @@ impl OrchestratorConnection {
             ServerOrcMsg::TranscribedText(_) => {
                 anyhow::bail!("Unexpected TranscribedText during session start")
             }
+            ServerOrcMsg::FeedbackChoice(_) => {
+                anyhow::bail!("Unexpected FeedbackChoice during session start")
+            }
         }
     }
 

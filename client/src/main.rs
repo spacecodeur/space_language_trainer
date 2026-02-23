@@ -10,7 +10,7 @@ mod vad;
 use anyhow::Result;
 use space_lt_common::protocol::{ClientMsg, ServerMsg, write_client_msg};
 use space_lt_common::{debug, info, warn};
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     // 2. TCP connect + Ready handshake (with exponential backoff retry)
     debug!("Connecting to server...");
     let conn = connection::TcpConnection::connect_with_retry(&server_addr)?;
+    let feedback_stream = conn.try_clone_stream()?;
     let shutdown_stream = conn.try_clone_stream()?;
     let (reader, writer) = conn.into_split();
 
@@ -94,6 +95,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
         .spawn(move || {
             tcp_reader_loop(
                 reader,
+                BufWriter::new(feedback_stream),
                 playback_tx,
                 output_rate,
                 tcp_shutdown,
@@ -312,9 +314,94 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Read a single keypress for feedback choice (no Enter needed).
+/// Returns true for "continue" (any key except '2'), false for "retry" ('2').
+fn read_single_key_choice(shutdown: &Arc<AtomicBool>) -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent};
+    use crossterm::terminal;
+
+    if terminal::enable_raw_mode().is_err() {
+        // Fallback to line-based input if raw mode fails
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        return input.trim() != "2";
+    }
+
+    let result = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break true;
+        }
+        // Poll with timeout so we can check shutdown
+        if event::poll(Duration::from_millis(500)).unwrap_or(false)
+            && let Ok(Event::Key(KeyEvent { code, .. })) = event::read()
+        {
+            break match code {
+                KeyCode::Char('2') => false,
+                KeyCode::Char('1') => true,
+                _ => continue, // ignore other keys
+            };
+        }
+    };
+
+    let _ = terminal::disable_raw_mode();
+    eprintln!(); // newline after the ">" prompt
+    result
+}
+
+/// Strip a color-like prefix from a feedback line (e.g. "RED:", "YELLOW:", "GREEN:").
+/// Returns the severity ("red" or "blue") and the remaining text.
+fn classify_feedback_line(line: &str) -> Option<(&str, &str)> {
+    // Known hard-error prefixes → red
+    for prefix in ["RED:", "ORANGE:"] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some(("red", rest.trim()));
+        }
+    }
+    // Known soft-suggestion prefixes → blue
+    for prefix in ["BLUE:", "YELLOW:", "GREEN:"] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            return Some(("blue", rest.trim()));
+        }
+    }
+    // Any other ALLCAPS_WORD: prefix Claude might invent → blue, strip the prefix
+    if let Some(colon_pos) = line.find(':') {
+        let candidate = &line[..colon_pos];
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '_')
+        {
+            return Some(("blue", line[colon_pos + 1..].trim()));
+        }
+    }
+    None
+}
+
+/// Display language feedback with ANSI colors.
+///
+/// Lines prefixed with `RED:` are shown in red with a cross mark.
+/// Lines prefixed with `BLUE:` are shown in blue with an arrow.
+/// Other color prefixes Claude might invent are mapped to red or blue.
+fn display_feedback(text: &str) {
+    eprintln!("\x1b[2m--- feedback ---\x1b[0m");
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (severity, content) = classify_feedback_line(trimmed).unwrap_or(("blue", trimmed));
+        match severity {
+            "red" => eprintln!("  \x1b[31m\u{2717} {content}\x1b[0m"),
+            _ => eprintln!("  \x1b[34m\u{279c} {content}\x1b[0m"),
+        }
+    }
+    eprintln!("\x1b[2m----------------\x1b[0m");
+}
+
 /// TCP reader loop: reads ServerMsg from TCP, routes TtsAudioChunk to playback.
 fn tcp_reader_loop(
     mut reader: BufReader<TcpStream>,
+    mut feedback_writer: BufWriter<TcpStream>,
     playback_tx: crossbeam_channel::Sender<Vec<i16>>,
     output_rate: u32,
     shutdown: Arc<AtomicBool>,
@@ -379,6 +466,32 @@ fn tcp_reader_loop(
             }
             ServerMsg::Error(err) => {
                 warn!("[client] Server error: {err}");
+            }
+            ServerMsg::Feedback(text) => {
+                display_feedback(&text);
+                eprintln!("  \x1b[1m[1] Continue  [2] Retry and re-speak\x1b[0m");
+                eprint!("  > ");
+                let _ = std::io::stderr().flush();
+
+                // Single-keypress read using crossterm raw mode
+                let proceed = read_single_key_choice(&shutdown);
+
+                if let Err(e) =
+                    write_client_msg(&mut feedback_writer, &ClientMsg::FeedbackChoice(proceed))
+                {
+                    if is_disconnect(&e) {
+                        debug!("[client] Server disconnected while sending FeedbackChoice");
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    warn!("[client] Failed to send FeedbackChoice: {e}");
+                }
+
+                if proceed {
+                    info!("[client] Continuing with AI response...");
+                } else {
+                    info!("[client] Retrying — please re-speak your sentence.");
+                }
             }
         }
     }
