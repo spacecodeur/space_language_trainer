@@ -90,6 +90,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
 
     // 6. Spawn tcp_reader thread
     let tcp_shutdown = shutdown.clone();
+    let (summary_tx, summary_rx) = crossbeam_channel::bounded::<String>(1);
     let tcp_reader_handle = std::thread::Builder::new()
         .name("tcp_reader".into())
         .spawn(move || {
@@ -100,6 +101,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                 output_rate,
                 tcp_shutdown,
                 is_playing_reader,
+                summary_tx,
             )
         })?;
 
@@ -129,9 +131,17 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     let mut chunk_count: u64 = 0;
     let mut listening_chunks: u64 = 0;
     let mut audio_accumulator: Vec<i16> = Vec::new(); // Manual mode: raw audio buffer
+    let quit_requested = Arc::new(AtomicBool::new(false));
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Check for 'q' key (quit with optional summary)
+        if !is_listening.load(Ordering::SeqCst) && poll_quit_key() {
+            info!("[client] Quit requested (q)");
+            quit_requested.store(true, Ordering::SeqCst);
             break;
         }
 
@@ -294,10 +304,43 @@ fn run_client(server_override: Option<String>) -> Result<()> {
         }
     }
 
-    // 11. Graceful shutdown
-    info!("Shutting down...");
-
+    // 11. Post-loop: summary prompt or direct shutdown
     drop(_capture_stream);
+
+    if quit_requested.load(Ordering::SeqCst) && !shutdown.load(Ordering::SeqCst) {
+        // User pressed 'q' — offer summary generation (TCP still open)
+        eprintln!();
+        eprintln!("  \x1b[1mGenerate session summary? [y/n]\x1b[0m");
+        eprint!("  > ");
+        let _ = std::io::stderr().flush();
+
+        let generate = read_summary_choice(&shutdown);
+
+        if generate {
+            info!("Generating summary...");
+            if let Err(e) = write_client_msg(&mut writer, &ClientMsg::SummaryRequest) {
+                warn!("[client] Failed to send SummaryRequest: {e}");
+            } else {
+                match summary_rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok(summary) => match save_summary(&summary) {
+                        Ok(path) => {
+                            info!("Session summary saved to: {}", path.display());
+                        }
+                        Err(e) => {
+                            warn!("[client] Failed to save summary: {e}");
+                        }
+                    },
+                    Err(_) => {
+                        warn!("[client] Summary generation timed out (60s)");
+                    }
+                }
+            }
+        }
+    }
+
+    // 12. Graceful shutdown
+    info!("Shutting down...");
+    shutdown.store(true, Ordering::SeqCst);
     let _ = shutdown_stream.shutdown(Shutdown::Both);
 
     // Wait for tcp_reader thread with timeout
@@ -312,6 +355,96 @@ fn run_client(server_override: Option<String>) -> Result<()> {
 
     info!("Shutdown complete.");
     Ok(())
+}
+
+/// Check if 'q' key was pressed using crossterm polling (non-blocking).
+fn poll_quit_key() -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+    use crossterm::terminal;
+
+    if terminal::is_raw_mode_enabled().unwrap_or(false) {
+        return false;
+    }
+
+    if terminal::enable_raw_mode().is_err() {
+        return false;
+    }
+
+    let quit = if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        matches!(
+            event::read(),
+            Ok(Event::Key(KeyEvent {
+                code: KeyCode::Char('q'),
+                kind: KeyEventKind::Press,
+                ..
+            }))
+        )
+    } else {
+        false
+    };
+
+    let _ = terminal::disable_raw_mode();
+    quit
+}
+
+/// Read a single keypress for summary choice (y/n).
+fn read_summary_choice(shutdown: &Arc<AtomicBool>) -> bool {
+    use crossterm::event::{self, Event, KeyCode, KeyEvent};
+    use crossterm::terminal;
+
+    if terminal::enable_raw_mode().is_err() {
+        return false;
+    }
+
+    let result = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break false;
+        }
+        if event::poll(Duration::from_millis(500)).unwrap_or(false)
+            && let Ok(Event::Key(KeyEvent { code, .. })) = event::read()
+        {
+            break match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => true,
+                KeyCode::Char('n') | KeyCode::Char('N') => false,
+                _ => continue,
+            };
+        }
+    };
+
+    let _ = terminal::disable_raw_mode();
+    eprintln!();
+    result
+}
+
+/// Save a session summary to ~/space-lt-sessions/YYYY-MM-DD_HH-MM.md
+fn save_summary(content: &str) -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(home).join("space-lt-sessions");
+    std::fs::create_dir_all(&dir)?;
+
+    let filename = format!("{}.md", format_timestamp());
+    let path = dir.join(filename);
+    std::fs::write(&path, content)?;
+    Ok(path)
+}
+
+/// Format current local time as YYYY-MM-DD_HH-MM.
+fn format_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!(
+        "{:04}-{:02}-{:02}_{:02}-{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+    )
 }
 
 /// Read a single keypress for feedback choice (no Enter needed).
@@ -406,6 +539,7 @@ fn tcp_reader_loop(
     output_rate: u32,
     shutdown: Arc<AtomicBool>,
     is_playing: Arc<AtomicBool>,
+    summary_tx: crossbeam_channel::Sender<String>,
 ) {
     // Create resampler if playback device isn't 16kHz
     let mut resample: Option<audio::ResamplerFn> = if output_rate != 16000 {
@@ -492,6 +626,10 @@ fn tcp_reader_loop(
                 } else {
                     info!("[client] Retrying — please re-speak your sentence.");
                 }
+            }
+            ServerMsg::SessionSummary(text) => {
+                debug!("[client] SessionSummary: {} bytes", text.len());
+                let _ = summary_tx.send(text);
             }
         }
     }

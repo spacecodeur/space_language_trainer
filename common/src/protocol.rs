@@ -24,6 +24,7 @@ pub enum ClientMsg {
     ResumeRequest,          // tag 0x03, empty payload
     InterruptTts,           // tag 0x04, empty payload
     FeedbackChoice(bool),   // tag 0x05, payload = 1 byte (0x01=continue, 0x00=retry)
+    SummaryRequest,         // tag 0x06, empty payload
 }
 
 // --- Server messages (server → client, tags 0x80-0xFF) ---
@@ -36,6 +37,7 @@ pub enum ServerMsg {
     TtsAudioChunk(Vec<i16>), // tag 0x83, payload = raw i16 LE bytes
     TtsEnd,                  // tag 0x84, empty payload
     Feedback(String),        // tag 0x85, payload = UTF-8 (language feedback, not spoken)
+    SessionSummary(String),  // tag 0x86, payload = UTF-8 markdown
 }
 
 // --- Orchestrator messages (orchestrator ↔ server, tags 0xA0-0xBF, Unix socket) ---
@@ -48,6 +50,8 @@ pub enum OrchestratorMsg {
     SessionEnd,              // tag 0xA3, empty payload
     FeedbackText(String),    // tag 0xA4, payload = UTF-8 (language feedback for display)
     FeedbackChoice(bool),    // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
+    SummaryRequest,          // tag 0xA6, empty payload
+    SummaryResponse(String), // tag 0xA7, payload = UTF-8 markdown
 }
 
 // --- Server-to-Orchestrator messages (read by orchestrator, combines server + orchestrator tags) ---
@@ -58,6 +62,7 @@ pub enum ServerOrcMsg {
     Error(String),           // tag 0x82, payload = UTF-8
     TranscribedText(String), // tag 0xA0, payload = UTF-8
     FeedbackChoice(bool),    // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
+    SummaryRequest,          // tag 0xA6, empty payload
 }
 
 // --- Wire format: [tag: u8][length: u32 LE][payload] ---
@@ -92,6 +97,11 @@ pub fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> Result<()> {
             w.write_all(&[0x05])?;
             w.write_all(&1u32.to_le_bytes())?;
             w.write_all(&[if *proceed { 0x01 } else { 0x00 }])?;
+            w.flush()?;
+        }
+        ClientMsg::SummaryRequest => {
+            w.write_all(&[0x06])?;
+            w.write_all(&0u32.to_le_bytes())?;
             w.flush()?;
         }
     }
@@ -146,6 +156,13 @@ pub fn read_client_msg(r: &mut impl Read) -> Result<ClientMsg> {
             let proceed = payload.first().copied().unwrap_or(0x01) != 0x00;
             Ok(ClientMsg::FeedbackChoice(proceed))
         }
+        0x06 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ClientMsg::SummaryRequest)
+        }
         other => bail!("Unknown client message tag: 0x{other:02x}"),
     }
 }
@@ -188,6 +205,13 @@ pub fn write_server_msg(w: &mut impl Write, msg: &ServerMsg) -> Result<()> {
         ServerMsg::Feedback(text) => {
             let payload = text.as_bytes();
             w.write_all(&[0x85])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
+        ServerMsg::SessionSummary(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0x86])?;
             w.write_all(&(payload.len() as u32).to_le_bytes())?;
             w.write_all(payload)?;
             w.flush()?;
@@ -246,6 +270,11 @@ pub fn read_server_msg(r: &mut impl Read) -> Result<ServerMsg> {
             r.read_exact(&mut payload)?;
             Ok(ServerMsg::Feedback(String::from_utf8(payload)?))
         }
+        0x86 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(ServerMsg::SessionSummary(String::from_utf8(payload)?))
+        }
         other => bail!("Unknown server message tag: 0x{other:02x}"),
     }
 }
@@ -289,6 +318,18 @@ pub fn write_orchestrator_msg(w: &mut impl Write, msg: &OrchestratorMsg) -> Resu
             w.write_all(&[0xA5])?;
             w.write_all(&1u32.to_le_bytes())?;
             w.write_all(&[if *proceed { 0x01 } else { 0x00 }])?;
+            w.flush()?;
+        }
+        OrchestratorMsg::SummaryRequest => {
+            w.write_all(&[0xA6])?;
+            w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+        OrchestratorMsg::SummaryResponse(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0xA7])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
             w.flush()?;
         }
     }
@@ -339,6 +380,20 @@ pub fn read_orchestrator_msg(r: &mut impl Read) -> Result<OrchestratorMsg> {
             let proceed = payload.first().copied().unwrap_or(0x01) != 0x00;
             Ok(OrchestratorMsg::FeedbackChoice(proceed))
         }
+        0xA6 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(OrchestratorMsg::SummaryRequest)
+        }
+        0xA7 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(OrchestratorMsg::SummaryResponse(String::from_utf8(
+                payload,
+            )?))
+        }
         other => bail!("Unknown orchestrator message tag: 0x{other:02x}"),
     }
 }
@@ -379,6 +434,13 @@ pub fn read_server_orc_msg(r: &mut impl Read) -> Result<ServerOrcMsg> {
             r.read_exact(&mut payload)?;
             let proceed = payload.first().copied().unwrap_or(0x01) != 0x00;
             Ok(ServerOrcMsg::FeedbackChoice(proceed))
+        }
+        0xA6 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ServerOrcMsg::SummaryRequest)
         }
         other => bail!("Unknown server-to-orchestrator message tag: 0x{other:02x}"),
     }
@@ -916,6 +978,59 @@ mod tests {
             ServerOrcMsg::FeedbackChoice(proceed) => assert!(!proceed),
             other => panic!("Expected FeedbackChoice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn round_trip_client_summary_request() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::SummaryRequest).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ClientMsg::SummaryRequest));
+    }
+
+    #[test]
+    fn round_trip_session_summary() {
+        let text = "## Session Summary\n\n### Key Vocabulary\n- word: definition".to_string();
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::SessionSummary(text.clone())).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        match msg {
+            ServerMsg::SessionSummary(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected SessionSummary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_orchestrator_summary_request() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SummaryRequest).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, OrchestratorMsg::SummaryRequest));
+    }
+
+    #[test]
+    fn round_trip_orchestrator_summary_response() {
+        let text = "# Summary\nContent here".to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SummaryResponse(text.clone())).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::SummaryResponse(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected SummaryResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_server_orc_msg_summary_request() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::SummaryRequest).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ServerOrcMsg::SummaryRequest));
     }
 
     #[test]

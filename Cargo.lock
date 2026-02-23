@@ -1909,6 +1909,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "evdev",
+ "libc",
  "ratatui",
  "rubato",
  "space_lt_common",

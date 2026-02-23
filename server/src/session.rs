@@ -192,6 +192,10 @@ fn stt_router(
                 );
                 write_orchestrator_msg(&mut writer, &OrchestratorMsg::FeedbackChoice(proceed))?;
             }
+            ClientMsg::SummaryRequest => {
+                info!("[server] Summary requested by client, forwarding to orchestrator");
+                write_orchestrator_msg(&mut writer, &OrchestratorMsg::SummaryRequest)?;
+            }
         }
     }
 
@@ -398,6 +402,19 @@ fn tts_router(
             OrchestratorMsg::SessionEnd => {
                 info!("[server] SessionEnd received, stopping session");
                 break;
+            }
+            OrchestratorMsg::SummaryResponse(text) => {
+                info!(
+                    "[server] Forwarding session summary to client ({} bytes)",
+                    text.len()
+                );
+                let mut w = client_writer
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                write_server_msg(&mut *w, &ServerMsg::SessionSummary(text))?;
+            }
+            OrchestratorMsg::SummaryRequest => {
+                debug!("[server] Unexpected SummaryRequest in tts_router (ignoring)");
             }
         }
     }

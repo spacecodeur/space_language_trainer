@@ -1,6 +1,6 @@
 # Story 6.6: Session Summary Generation
 
-Status: ready-for-dev
+Status: done
 
 ## Story
 

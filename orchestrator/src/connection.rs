@@ -54,6 +54,9 @@ impl OrchestratorConnection {
             ServerOrcMsg::FeedbackChoice(_) => {
                 anyhow::bail!("Unexpected FeedbackChoice during session start")
             }
+            ServerOrcMsg::SummaryRequest => {
+                anyhow::bail!("Unexpected SummaryRequest during session start")
+            }
         }
     }
 

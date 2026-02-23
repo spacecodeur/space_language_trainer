@@ -15,6 +15,29 @@ use crate::claude::LlmBackend;
 /// especially when using web search. This inline reminder keeps it on track.
 const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max. If you notice grammar errors or unnatural phrasing in the user's message, prepend a [FEEDBACK]...[/FEEDBACK] block before your spoken response.]\n\n";
 
+/// Prompt for generating a structured session summary in markdown.
+/// Sent with continue_session=true so Claude has full conversation context.
+/// Does NOT include FORMAT_REMINDER — this produces markdown, not voice.
+const SUMMARY_PROMPT: &str = r#"Generate a detailed session summary in markdown format. Structure it with these exact sections:
+
+## Session Summary
+
+### Key Vocabulary
+List important words and expressions that came up during the session, with brief definitions or usage context. If no notable vocabulary was introduced, write "No new vocabulary introduced in this session."
+
+### Errors & Corrections
+For each significant error the user made, show:
+- What was said → What should have been said (explanation)
+If no errors occurred, write "No significant errors noted."
+
+### Grammar Points
+Summarize grammar topics discussed (tenses, prepositions, articles, etc.) with brief reminders of the rules. If no grammar was explicitly discussed, write "No specific grammar points covered."
+
+### Session Highlights
+What the user did well, topics covered, and suggested focus areas for next time.
+
+Output ONLY the markdown content. No preamble, no closing remarks. Do not wrap the output in a code block."#;
+
 /// Voice loop state (for logging).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VoiceLoopState {
@@ -93,6 +116,19 @@ pub fn run_voice_loop(
             ServerOrcMsg::FeedbackChoice(_) => {
                 warn!("[orchestrator] Unexpected FeedbackChoice outside feedback flow");
                 continue;
+            }
+            ServerOrcMsg::SummaryRequest => {
+                info!("[orchestrator] Summary requested, querying LLM...");
+                let summary = match backend.query(SUMMARY_PROMPT, agent_path, turn_count > 0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("[orchestrator] Summary generation failed: {e}");
+                        format!("## Session Summary\n\n*Summary generation failed: {e}*")
+                    }
+                };
+                info!("[orchestrator] Summary generated ({} bytes)", summary.len());
+                write_orchestrator_msg(writer, &OrchestratorMsg::SummaryResponse(summary))?;
+                break;
             }
         };
 
@@ -664,5 +700,54 @@ mod tests {
 
         orch_handle.join().unwrap();
         std::fs::remove_file(&sock_path).ok();
+    }
+
+    #[test]
+    fn voice_loop_handles_summary_request() {
+        let (orch_stream, server_stream) = UnixStream::pair().unwrap();
+
+        let server_handle = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
+            let mut writer = BufWriter::new(server_stream);
+
+            // Send a transcription first to simulate a real session
+            write_orchestrator_msg(
+                &mut writer,
+                &OrchestratorMsg::TranscribedText("Hello".into()),
+            )
+            .unwrap();
+
+            // Read the response
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            assert!(matches!(msg, OrchestratorMsg::ResponseText(_)));
+
+            // Now send SummaryRequest
+            write_orchestrator_msg(&mut writer, &OrchestratorMsg::SummaryRequest).unwrap();
+
+            // Read SummaryResponse
+            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            match msg {
+                OrchestratorMsg::SummaryResponse(s) => {
+                    assert_eq!(s, "Mock summary");
+                }
+                other => panic!("Expected SummaryResponse, got {other:?}"),
+            }
+
+            drop(writer);
+            drop(reader);
+        });
+
+        let backend = MockLlmBackend::new(vec![
+            "Great conversation!".to_string(),
+            "Mock summary".to_string(),
+        ]);
+        let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(orch_stream);
+        let agent_path = PathBuf::from("agent.md");
+
+        let result = run_voice_loop(&mut reader, &mut writer, &backend, &agent_path);
+        assert!(result.is_ok());
+
+        server_handle.join().unwrap();
     }
 }
