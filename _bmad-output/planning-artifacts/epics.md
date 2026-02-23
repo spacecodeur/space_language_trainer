@@ -215,8 +215,9 @@ Epic 1 (Foundation)
                  6.2 Streaming TTS                     [done]
                  6.3 TTS GPU evaluation (research)     [done]
                  6.4 Migrate TTS to ort + Kokoro ONNX  [ready-for-dev] (depends on 6.3)
-                 6.5 Visual Language Feedback          [in-progress]
-                 6.6 Session Summary Generation        [ready-for-dev]
+                 6.5 Visual Language Feedback          [done]
+                 6.6 Session Summary Generation        [done]
+                 6.7 Multi-Language Support             [ready-for-dev]
 ```
 
 Story 6.2 (streaming TTS) depends on 6.1 (barge-in) because streaming needs interrupt support to handle mid-stream barge-in correctly.

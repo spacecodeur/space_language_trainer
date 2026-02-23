@@ -85,4 +85,5 @@ development_status:
   6-4-migrate-tts-to-ort-kokoro: ready-for-dev
   6-5-visual-language-feedback: done
   6-6-session-summary-generation: done
+  6-7-multi-language-support: ready-for-dev
   epic-6-retrospective: optional
