@@ -13,7 +13,7 @@ use crate::claude::LlmBackend;
 /// Short reminder prepended to every user prompt to reinforce voice output rules.
 /// On --continue turns, Claude may "forget" the system prompt's formatting rules,
 /// especially when using web search. This inline reminder keeps it on track.
-const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max. If you notice grammar errors or unnatural phrasing in the user's message, prepend a [FEEDBACK]...[/FEEDBACK] block before your spoken response.]\n\n";
+const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max. If you notice grammar errors or unnatural phrasing, prepend a [FEEDBACK] block. Inside the block, every line MUST start with RED:, BLUE:, or CORRECTED: — never write prose. Example:\n[FEEDBACK]\nRED: \"I have went\" → \"I went\" (past simple)\nCORRECTED: I <<went>> to the store.\n[/FEEDBACK]\nYour spoken reply here.\nIf the user asks to speak slower/faster/normal, you MUST prefix your response with [SPEED:X.X] (0.5=much slower, 0.6=slower, 0.8=normal, 1.0=faster). You DO control speech speed via this tag. Speed persists until changed — to return to normal, use [SPEED:0.8].]\n\n";
 
 /// Prompt for generating a structured session summary in markdown.
 /// Sent with continue_session=true so Claude has full conversation context.
@@ -216,7 +216,7 @@ pub fn run_voice_loop(
                 Some(false) => {
                     info!("[orchestrator] User chose to retry — skipping response");
                     retry_context = Some(
-                        "[The user chose to rephrase their previous statement. Their new attempt follows:]\n\n"
+                        "[The user chose to rephrase their previous statement. Their new attempt follows. Do NOT comment on the correction or praise the grammar — just respond naturally to the content as if it were a normal conversational turn.]\n\n"
                             .to_string(),
                     );
                     state = VoiceLoopState::WaitingForTranscription;
