@@ -61,7 +61,15 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     // 1. TUI setup
     let config = tui::run_setup()?;
 
-    let server_addr = server_override.unwrap_or(config.server_addr);
+    let server_addr = server_override
+        .map(|s| {
+            if s.contains(':') {
+                s
+            } else {
+                format!("{s}:9500")
+            }
+        })
+        .unwrap_or(config.server_addr);
 
     debug!("  Server:  {server_addr}");
     debug!("  Device:  {}", config.device_name);
@@ -80,6 +88,12 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     let playback_clear = Arc::new(AtomicBool::new(false));
     let (_playback_stream, output_rate) =
         playback::start_playback(playback_rx, playback_clear.clone())?;
+
+    // 3b. Replay support: shared buffer for last TTS response + clone of playback_tx
+    let last_tts_audio: Arc<std::sync::Mutex<Vec<i16>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let last_tts_audio_writer = last_tts_audio.clone();
+    let replay_tx = playback_tx.clone();
 
     // 4. Shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -102,6 +116,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                 tcp_shutdown,
                 is_playing_reader,
                 summary_tx,
+                last_tts_audio_writer,
             )
         })?;
 
@@ -138,11 +153,21 @@ fn run_client(server_override: Option<String>) -> Result<()> {
             break;
         }
 
-        // Check for 'q' key (quit with optional summary)
-        if !is_listening.load(Ordering::SeqCst) && poll_quit_key() {
-            info!("[client] Quit requested (q)");
-            quit_requested.store(true, Ordering::SeqCst);
-            break;
+        // Check for 'q' (quit) or '3' (replay) when not listening
+        if !is_listening.load(Ordering::SeqCst) {
+            match poll_key_action() {
+                PollAction::Quit => {
+                    info!("[client] Quit requested (q)");
+                    quit_requested.store(true, Ordering::SeqCst);
+                    break;
+                }
+                PollAction::Replay => {
+                    if !is_playing.load(Ordering::SeqCst) {
+                        replay_last_audio(&last_tts_audio, &replay_tx);
+                    }
+                }
+                PollAction::None => {}
+            }
         }
 
         let chunk = match audio_rx.recv_timeout(Duration::from_millis(100)) {
@@ -357,34 +382,73 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Check if 'q' key was pressed using crossterm polling (non-blocking).
-fn poll_quit_key() -> bool {
+/// Result of non-blocking key poll when not listening.
+enum PollAction {
+    None,
+    Quit,
+    Replay,
+}
+
+/// Check for 'q' (quit) or '3' (replay) key press using crossterm polling (non-blocking).
+fn poll_key_action() -> PollAction {
     use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
     use crossterm::terminal;
 
     if terminal::is_raw_mode_enabled().unwrap_or(false) {
-        return false;
+        return PollAction::None;
     }
 
     if terminal::enable_raw_mode().is_err() {
-        return false;
+        return PollAction::None;
     }
 
-    let quit = if event::poll(Duration::from_millis(0)).unwrap_or(false) {
-        matches!(
-            event::read(),
+    let action = if event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        match event::read() {
             Ok(Event::Key(KeyEvent {
                 code: KeyCode::Char('q'),
                 kind: KeyEventKind::Press,
                 ..
-            }))
-        )
+            })) => PollAction::Quit,
+            Ok(Event::Key(KeyEvent {
+                code: KeyCode::Char('3'),
+                kind: KeyEventKind::Press,
+                ..
+            })) => PollAction::Replay,
+            _ => PollAction::None,
+        }
     } else {
-        false
+        PollAction::None
     };
 
     let _ = terminal::disable_raw_mode();
-    quit
+    action
+}
+
+/// Chunk size for replay playback (matches typical TTS chunk size).
+const REPLAY_CHUNK_SIZE: usize = 4000;
+
+/// Maximum replay buffer size in samples (~5 minutes at 16 kHz mono).
+const REPLAY_BUFFER_MAX_SAMPLES: usize = 16_000 * 60 * 5;
+
+/// Replay the last TTS response audio through the playback channel.
+fn replay_last_audio(
+    audio: &Arc<std::sync::Mutex<Vec<i16>>>,
+    playback_tx: &crossbeam_channel::Sender<Vec<i16>>,
+) {
+    let samples = if let Ok(buf) = audio.lock() {
+        buf.clone()
+    } else {
+        return;
+    };
+    if samples.is_empty() {
+        return;
+    }
+    info!("[REPLAY]");
+    for chunk in samples.chunks(REPLAY_CHUNK_SIZE) {
+        if playback_tx.send(chunk.to_vec()).is_err() {
+            break;
+        }
+    }
 }
 
 /// Read a single keypress for summary choice (y/n).
@@ -447,9 +511,16 @@ fn format_timestamp() -> String {
     )
 }
 
+/// Feedback choice result.
+enum FeedbackAction {
+    Continue,
+    Retry,
+    Replay,
+}
+
 /// Read a single keypress for feedback choice (no Enter needed).
-/// Returns true for "continue" (any key except '2'), false for "retry" ('2').
-fn read_single_key_choice(shutdown: &Arc<AtomicBool>) -> bool {
+/// Returns Continue ('1'), Retry ('2'), or Replay ('3').
+fn read_feedback_choice(shutdown: &Arc<AtomicBool>) -> FeedbackAction {
     use crossterm::event::{self, Event, KeyCode, KeyEvent};
     use crossterm::terminal;
 
@@ -457,20 +528,25 @@ fn read_single_key_choice(shutdown: &Arc<AtomicBool>) -> bool {
         // Fallback to line-based input if raw mode fails
         let mut input = String::new();
         let _ = std::io::stdin().read_line(&mut input);
-        return input.trim() != "2";
+        return match input.trim() {
+            "2" => FeedbackAction::Retry,
+            "3" => FeedbackAction::Replay,
+            _ => FeedbackAction::Continue,
+        };
     }
 
     let result = loop {
         if shutdown.load(Ordering::SeqCst) {
-            break true;
+            break FeedbackAction::Continue;
         }
         // Poll with timeout so we can check shutdown
         if event::poll(Duration::from_millis(500)).unwrap_or(false)
             && let Ok(Event::Key(KeyEvent { code, .. })) = event::read()
         {
             break match code {
-                KeyCode::Char('2') => false,
-                KeyCode::Char('1') => true,
+                KeyCode::Char('1') => FeedbackAction::Continue,
+                KeyCode::Char('2') => FeedbackAction::Retry,
+                KeyCode::Char('3') => FeedbackAction::Replay,
                 _ => continue, // ignore other keys
             };
         }
@@ -623,6 +699,7 @@ fn display_feedback(text: &str) {
 }
 
 /// TCP reader loop: reads ServerMsg from TCP, routes TtsAudioChunk to playback.
+#[allow(clippy::too_many_arguments)]
 fn tcp_reader_loop(
     mut reader: BufReader<TcpStream>,
     mut feedback_writer: BufWriter<TcpStream>,
@@ -631,6 +708,7 @@ fn tcp_reader_loop(
     shutdown: Arc<AtomicBool>,
     is_playing: Arc<AtomicBool>,
     summary_tx: crossbeam_channel::Sender<String>,
+    last_tts_audio: Arc<std::sync::Mutex<Vec<i16>>>,
 ) {
     // Create resampler if playback device isn't 16kHz
     let mut resample: Option<audio::ResamplerFn> = if output_rate != 16000 {
@@ -674,6 +752,12 @@ fn tcp_reader_loop(
                     Some(r) => r(&samples),
                     None => samples,
                 };
+                // Accumulate for replay (capped to prevent unbounded growth)
+                if let Ok(mut buf) = last_tts_audio.lock()
+                    && buf.len() + output.len() <= REPLAY_BUFFER_MAX_SAMPLES
+                {
+                    buf.extend_from_slice(&output);
+                }
                 if playback_tx.send(output).is_err() {
                     debug!("[client] Playback channel closed");
                     break;
@@ -682,11 +766,24 @@ fn tcp_reader_loop(
             ServerMsg::TtsEnd => {
                 debug!("[client] TtsEnd received");
                 is_playing.store(false, Ordering::SeqCst);
+                let has_audio = last_tts_audio
+                    .lock()
+                    .map(|buf| !buf.is_empty())
+                    .unwrap_or(false);
+                if has_audio {
+                    eprintln!("  \x1b[2m[3] Replay\x1b[0m");
+                }
             }
             ServerMsg::Ready => {
                 debug!("[client] Unexpected Ready (ignoring)");
             }
             ServerMsg::Text(text) => {
+                // Clear replay buffer when a new AI response starts
+                if text.starts_with("AI:")
+                    && let Ok(mut buf) = last_tts_audio.lock()
+                {
+                    buf.clear();
+                }
                 info!("[client] {text}");
             }
             ServerMsg::Error(err) => {
@@ -694,12 +791,21 @@ fn tcp_reader_loop(
             }
             ServerMsg::Feedback(text) => {
                 display_feedback(&text);
-                eprintln!("  \x1b[1m[1] Continue  [2] Retry and re-speak\x1b[0m");
-                eprint!("  > ");
-                let _ = std::io::stderr().flush();
 
-                // Single-keypress read using crossterm raw mode
-                let proceed = read_single_key_choice(&shutdown);
+                // Feedback choice loop (supports replay before deciding)
+                let proceed = loop {
+                    eprintln!("  \x1b[1m[1] Continue  [2] Retry and re-speak  [3] Replay\x1b[0m");
+                    eprint!("  > ");
+                    let _ = std::io::stderr().flush();
+
+                    match read_feedback_choice(&shutdown) {
+                        FeedbackAction::Replay => {
+                            replay_last_audio(&last_tts_audio, &playback_tx);
+                        }
+                        FeedbackAction::Continue => break true,
+                        FeedbackAction::Retry => break false,
+                    }
+                };
 
                 if let Err(e) =
                     write_client_msg(&mut feedback_writer, &ClientMsg::FeedbackChoice(proceed))
