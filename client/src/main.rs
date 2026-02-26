@@ -61,15 +61,12 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     // 1. TUI setup
     let config = tui::run_setup()?;
 
-    let server_addr = server_override
-        .map(|s| {
-            if s.contains(':') {
-                s
-            } else {
-                format!("{s}:9500")
-            }
-        })
-        .unwrap_or(config.server_addr);
+    let server_addr = server_override.unwrap_or(config.server_addr);
+    let server_addr = if server_addr.contains(':') {
+        server_addr
+    } else {
+        format!("{server_addr}:9500")
+    };
 
     debug!("  Server:  {server_addr}");
     debug!("  Device:  {}", config.device_name);
