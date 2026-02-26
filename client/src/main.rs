@@ -718,6 +718,9 @@ fn tcp_reader_loop(
                     info!("[client] Retrying — please re-speak your sentence.");
                 }
             }
+            ServerMsg::StatusNotification(text) => {
+                eprintln!("  \x1b[2;3m{text}\x1b[0m");
+            }
             ServerMsg::SessionSummary(text) => {
                 debug!("[client] SessionSummary: {} bytes", text.len());
                 let _ = summary_tx.send(text);

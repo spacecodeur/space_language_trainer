@@ -31,27 +31,29 @@ pub enum ClientMsg {
 
 #[derive(Debug)]
 pub enum ServerMsg {
-    Ready,                   // tag 0x80, empty payload
-    Text(String),            // tag 0x81, payload = UTF-8
-    Error(String),           // tag 0x82, payload = UTF-8
-    TtsAudioChunk(Vec<i16>), // tag 0x83, payload = raw i16 LE bytes
-    TtsEnd,                  // tag 0x84, empty payload
-    Feedback(String),        // tag 0x85, payload = UTF-8 (language feedback, not spoken)
-    SessionSummary(String),  // tag 0x86, payload = UTF-8 markdown
+    Ready,                      // tag 0x80, empty payload
+    Text(String),               // tag 0x81, payload = UTF-8
+    Error(String),              // tag 0x82, payload = UTF-8
+    TtsAudioChunk(Vec<i16>),    // tag 0x83, payload = raw i16 LE bytes
+    TtsEnd,                     // tag 0x84, empty payload
+    Feedback(String),           // tag 0x85, payload = UTF-8 (language feedback, not spoken)
+    SessionSummary(String),     // tag 0x86, payload = UTF-8 markdown
+    StatusNotification(String), // tag 0x87, payload = UTF-8 (e.g. "Thinking...", "Searching the web...")
 }
 
 // --- Orchestrator messages (orchestrator ↔ server, tags 0xA0-0xBF, Unix socket) ---
 
 #[derive(Debug)]
 pub enum OrchestratorMsg {
-    TranscribedText(String), // tag 0xA0, payload = UTF-8
-    ResponseText(String),    // tag 0xA1, payload = UTF-8
-    SessionStart(String),    // tag 0xA2, payload = UTF-8 JSON (raw string)
-    SessionEnd,              // tag 0xA3, empty payload
-    FeedbackText(String),    // tag 0xA4, payload = UTF-8 (language feedback for display)
-    FeedbackChoice(bool),    // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
-    SummaryRequest,          // tag 0xA6, empty payload
-    SummaryResponse(String), // tag 0xA7, payload = UTF-8 markdown
+    TranscribedText(String),    // tag 0xA0, payload = UTF-8
+    ResponseText(String),       // tag 0xA1, payload = UTF-8
+    SessionStart(String),       // tag 0xA2, payload = UTF-8 JSON (raw string)
+    SessionEnd,                 // tag 0xA3, empty payload
+    FeedbackText(String),       // tag 0xA4, payload = UTF-8 (language feedback for display)
+    FeedbackChoice(bool),       // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
+    SummaryRequest,             // tag 0xA6, empty payload
+    SummaryResponse(String),    // tag 0xA7, payload = UTF-8 markdown
+    StatusNotification(String), // tag 0xA8, payload = UTF-8 (e.g. "Thinking...", "Searching the web...")
 }
 
 // --- Server-to-Orchestrator messages (read by orchestrator, combines server + orchestrator tags) ---
@@ -216,6 +218,13 @@ pub fn write_server_msg(w: &mut impl Write, msg: &ServerMsg) -> Result<()> {
             w.write_all(payload)?;
             w.flush()?;
         }
+        ServerMsg::StatusNotification(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0x87])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
     }
     Ok(())
 }
@@ -275,6 +284,11 @@ pub fn read_server_msg(r: &mut impl Read) -> Result<ServerMsg> {
             r.read_exact(&mut payload)?;
             Ok(ServerMsg::SessionSummary(String::from_utf8(payload)?))
         }
+        0x87 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(ServerMsg::StatusNotification(String::from_utf8(payload)?))
+        }
         other => bail!("Unknown server message tag: 0x{other:02x}"),
     }
 }
@@ -328,6 +342,13 @@ pub fn write_orchestrator_msg(w: &mut impl Write, msg: &OrchestratorMsg) -> Resu
         OrchestratorMsg::SummaryResponse(text) => {
             let payload = text.as_bytes();
             w.write_all(&[0xA7])?;
+            w.write_all(&(payload.len() as u32).to_le_bytes())?;
+            w.write_all(payload)?;
+            w.flush()?;
+        }
+        OrchestratorMsg::StatusNotification(text) => {
+            let payload = text.as_bytes();
+            w.write_all(&[0xA8])?;
             w.write_all(&(payload.len() as u32).to_le_bytes())?;
             w.write_all(payload)?;
             w.flush()?;
@@ -391,6 +412,13 @@ pub fn read_orchestrator_msg(r: &mut impl Read) -> Result<OrchestratorMsg> {
             let mut payload = vec![0u8; len];
             r.read_exact(&mut payload)?;
             Ok(OrchestratorMsg::SummaryResponse(String::from_utf8(
+                payload,
+            )?))
+        }
+        0xA8 => {
+            let mut payload = vec![0u8; len];
+            r.read_exact(&mut payload)?;
+            Ok(OrchestratorMsg::StatusNotification(String::from_utf8(
                 payload,
             )?))
         }
@@ -1061,5 +1089,34 @@ mod tests {
     fn is_disconnect_ignores_other_errors() {
         let err = anyhow::anyhow!("some other error");
         assert!(!super::is_disconnect(&err));
+    }
+
+    // --- StatusNotification tests ---
+
+    #[test]
+    fn round_trip_server_status_notification() {
+        let text = "Thinking...".to_string();
+        let mut buf = Vec::new();
+        write_server_msg(&mut buf, &ServerMsg::StatusNotification(text.clone())).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_msg(&mut cursor).unwrap();
+        match msg {
+            ServerMsg::StatusNotification(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected StatusNotification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_orchestrator_status_notification() {
+        let text = "Searching the web...".to_string();
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::StatusNotification(text.clone()))
+            .unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        match msg {
+            OrchestratorMsg::StatusNotification(decoded) => assert_eq!(decoded, text),
+            other => panic!("Expected StatusNotification, got {other:?}"),
+        }
     }
 }

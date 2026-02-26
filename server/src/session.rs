@@ -416,6 +416,13 @@ fn tts_router(
             OrchestratorMsg::SummaryRequest => {
                 debug!("[server] Unexpected SummaryRequest in tts_router (ignoring)");
             }
+            OrchestratorMsg::StatusNotification(text) => {
+                debug!("[server] Forwarding status notification: {text}");
+                let mut w = client_writer
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                write_server_msg(&mut *w, &ServerMsg::StatusNotification(text))?;
+            }
         }
     }
 

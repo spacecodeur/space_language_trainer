@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -122,6 +122,10 @@ pub fn run_voice_loop(
             }
             ServerOrcMsg::SummaryRequest => {
                 info!("[orchestrator] Summary requested, querying LLM...");
+                let _ = write_orchestrator_msg(
+                    writer,
+                    &OrchestratorMsg::StatusNotification("Generating summary...".to_string()),
+                );
                 let summary = match backend.query(SUMMARY_PROMPT, agent_path, turn_count > 0) {
                     Ok(s) => s,
                     Err(e) => {
@@ -143,6 +147,12 @@ pub fn run_voice_loop(
         turn_count += 1;
         info!("[orchestrator] Turn {turn_count}: received '{text}'");
 
+        // Notify client that LLM is processing
+        let _ = write_orchestrator_msg(
+            writer,
+            &OrchestratorMsg::StatusNotification("Thinking...".to_string()),
+        );
+
         // Prepend retry context if user chose to rephrase on previous turn
         let augmented_prompt = if let Some(ctx) = retry_context.take() {
             format!("{FORMAT_REMINDER}{ctx}{text}")
@@ -151,7 +161,28 @@ pub fn run_voice_loop(
         };
         let query_start = std::time::Instant::now();
 
-        let response = match backend.query(&augmented_prompt, agent_path, turn_count > 1) {
+        // Run query in a scoped thread so we can forward status updates
+        // (e.g. "Searching the web...") to the client while the query blocks.
+        let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+        let response = std::thread::scope(|s| -> Result<String> {
+            let handle = s.spawn(|| {
+                backend.query_with_status(&augmented_prompt, agent_path, turn_count > 1, status_tx)
+            });
+
+            // Drain status updates until sender is dropped (query finished)
+            for status in &status_rx {
+                info!("[orchestrator] Status update: {status}");
+                let _ =
+                    write_orchestrator_msg(writer, &OrchestratorMsg::StatusNotification(status));
+            }
+
+            match handle.join() {
+                Ok(result) => result,
+                Err(_) => bail!("LLM query thread panicked"),
+            }
+        });
+
+        let response = match response {
             Ok(r) => r,
             Err(e) => {
                 warn!("[orchestrator] LLM query failed unexpectedly: {e}");
@@ -249,6 +280,18 @@ mod tests {
     use space_lt_common::protocol::{read_orchestrator_msg, write_orchestrator_msg};
     use std::path::PathBuf;
 
+    /// Read the next OrchestratorMsg that is NOT a StatusNotification.
+    /// StatusNotification messages are expected (from "Thinking..." etc.) and skipped.
+    fn read_next_non_status(reader: &mut impl std::io::Read) -> OrchestratorMsg {
+        loop {
+            let msg = read_orchestrator_msg(reader).unwrap();
+            if matches!(msg, OrchestratorMsg::StatusNotification(_)) {
+                continue;
+            }
+            return msg;
+        }
+    }
+
     // --- parse_feedback tests ---
 
     #[test]
@@ -326,8 +369,8 @@ mod tests {
             )
             .unwrap();
 
-            // Server reads ResponseText
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Server reads ResponseText (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Mock response A"),
                 other => panic!("Expected ResponseText, got {other:?}"),
@@ -368,8 +411,8 @@ mod tests {
             )
             .unwrap();
 
-            // Read the response
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Read the response (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Reply"),
                 other => panic!("Expected ResponseText, got {other:?}"),
@@ -405,7 +448,7 @@ mod tests {
                 &OrchestratorMsg::TranscribedText("Turn one".into()),
             )
             .unwrap();
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "A"),
                 other => panic!("Expected ResponseText A, got {other:?}"),
@@ -417,7 +460,7 @@ mod tests {
                 &OrchestratorMsg::TranscribedText("Turn two".into()),
             )
             .unwrap();
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "B"),
                 other => panic!("Expected ResponseText B, got {other:?}"),
@@ -455,8 +498,8 @@ mod tests {
             )
             .unwrap();
 
-            // Should receive fallback error message
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Should receive fallback error message (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => {
                     assert_eq!(t, "I'm sorry, something went wrong. Please try again.");
@@ -471,8 +514,8 @@ mod tests {
             )
             .unwrap();
 
-            // Should receive normal response
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Should receive normal response (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Normal response"),
                 other => panic!("Expected 'Normal response', got {other:?}"),
@@ -510,8 +553,8 @@ mod tests {
             )
             .unwrap();
 
-            // Server reads FeedbackText (orchestrator parsed it from LLM response)
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Server reads FeedbackText (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match &msg {
                 OrchestratorMsg::FeedbackText(fb) => assert!(fb.contains("RED:")),
                 other => panic!("Expected FeedbackText, got {other:?}"),
@@ -521,7 +564,7 @@ mod tests {
             write_orchestrator_msg(&mut writer, &OrchestratorMsg::FeedbackChoice(true)).unwrap();
 
             // Server reads ResponseText (spoken part only)
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => {
                     assert_eq!(t, "That sounds good! Tell me more.");
@@ -561,8 +604,8 @@ mod tests {
             )
             .unwrap();
 
-            // Server reads FeedbackText
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Server reads FeedbackText (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             assert!(matches!(msg, OrchestratorMsg::FeedbackText(_)));
 
             // Server sends FeedbackChoice(false) — user chose retry
@@ -577,8 +620,8 @@ mod tests {
             )
             .unwrap();
 
-            // Server reads ResponseText for turn 2 (no feedback this time)
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Server reads ResponseText for turn 2 (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Great job! Much better."),
                 other => panic!("Expected ResponseText, got {other:?}"),
@@ -617,8 +660,8 @@ mod tests {
             )
             .unwrap();
 
-            // Should get ResponseText directly (no FeedbackText)
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Should get ResponseText directly (skipping StatusNotification, no FeedbackText)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::ResponseText(t) => assert_eq!(t, "That's great!"),
                 other => panic!("Expected ResponseText, got {other:?}"),
@@ -690,8 +733,8 @@ mod tests {
         )
         .unwrap();
 
-        // Read ResponseText
-        let msg = read_orchestrator_msg(&mut server_reader).unwrap();
+        // Read ResponseText (skipping StatusNotification)
+        let msg = read_next_non_status(&mut server_reader);
         match msg {
             OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Response one"),
             other => panic!("Expected ResponseText, got {other:?}"),
@@ -720,15 +763,15 @@ mod tests {
             )
             .unwrap();
 
-            // Read the response
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Read the response (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             assert!(matches!(msg, OrchestratorMsg::ResponseText(_)));
 
             // Now send SummaryRequest
             write_orchestrator_msg(&mut writer, &OrchestratorMsg::SummaryRequest).unwrap();
 
-            // Read SummaryResponse
-            let msg = read_orchestrator_msg(&mut reader).unwrap();
+            // Read SummaryResponse (skipping StatusNotification)
+            let msg = read_next_non_status(&mut reader);
             match msg {
                 OrchestratorMsg::SummaryResponse(s) => {
                     assert_eq!(s, "Mock summary");

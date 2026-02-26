@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Trait abstracting LLM invocation. Enables mock-based testing
 /// without requiring real Claude CLI calls.
-pub trait LlmBackend: Send {
+pub trait LlmBackend: Send + Sync {
     /// Query the LLM with a prompt.
     ///
     /// - `system_prompt_file`: path to agent definition file (read on first turn)
@@ -15,6 +15,20 @@ pub trait LlmBackend: Send {
         system_prompt_file: &Path,
         continue_session: bool,
     ) -> Result<String>;
+
+    /// Query the LLM with a status notification channel.
+    ///
+    /// Backends that can detect intermediate states (e.g. web search in progress)
+    /// send status strings on `status_tx`. Default: delegates to `query()`.
+    fn query_with_status(
+        &self,
+        prompt: &str,
+        system_prompt_file: &Path,
+        continue_session: bool,
+        _status_tx: std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        self.query(prompt, system_prompt_file, continue_session)
+    }
 }
 
 /// Mock backend returning predefined responses in order, cycling when exhausted.
@@ -112,14 +126,18 @@ impl ClaudeCliBackend {
     }
 
     /// Execute a single Claude CLI query with a 30-second timeout.
+    ///
+    /// If `status_tx` is provided, stderr is streamed line-by-line and web search
+    /// activity is detected and reported via the channel.
     fn query_once(
         &self,
         prompt: &str,
         system_prompt_file: &Path,
         continue_session: bool,
+        status_tx: Option<&std::sync::mpsc::Sender<String>>,
     ) -> Result<String> {
         use space_lt_common::debug;
-        use std::io::{Read, Write};
+        use std::io::{BufRead, Read, Write};
         use std::process::{Command, Stdio};
 
         debug!(
@@ -153,10 +171,8 @@ impl ClaudeCliBackend {
             // stdin drops here, closing the pipe
         }
 
-        // Read stdout/stderr in background threads (they block until process exits)
+        // Read stdout in background thread (blocks until process exits)
         let stdout_pipe = child.stdout.take().unwrap();
-        let stderr_pipe = child.stderr.take().unwrap();
-
         let stdout_handle = std::thread::spawn(move || {
             let mut buf = String::new();
             std::io::BufReader::new(stdout_pipe)
@@ -164,12 +180,27 @@ impl ClaudeCliBackend {
                 .ok();
             buf
         });
+
+        // Read stderr line-by-line to detect web search activity
+        let stderr_pipe = child.stderr.take().unwrap();
+        let status_tx_clone = status_tx.cloned();
         let stderr_handle = std::thread::spawn(move || {
-            let mut buf = String::new();
-            std::io::BufReader::new(stderr_pipe)
-                .read_to_string(&mut buf)
-                .ok();
-            buf
+            let mut collected = String::new();
+            let reader = std::io::BufReader::new(stderr_pipe);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                debug!("[orchestrator] Claude stderr: {line}");
+                // Detect web search activity from Claude CLI stderr
+                if let Some(tx) = &status_tx_clone {
+                    let lower = line.to_lowercase();
+                    if lower.contains("web") && lower.contains("search") {
+                        let _ = tx.send("Searching the web...".to_string());
+                    }
+                }
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+            collected
         });
 
         // Poll child with try_wait() + timeout deadline
@@ -221,13 +252,40 @@ impl LlmBackend for ClaudeCliBackend {
         system_prompt_file: &Path,
         continue_session: bool,
     ) -> Result<String> {
+        self.query_with_retries(prompt, system_prompt_file, continue_session, None)
+    }
+
+    fn query_with_status(
+        &self,
+        prompt: &str,
+        system_prompt_file: &Path,
+        continue_session: bool,
+        status_tx: std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        self.query_with_retries(
+            prompt,
+            system_prompt_file,
+            continue_session,
+            Some(&status_tx),
+        )
+    }
+}
+
+impl ClaudeCliBackend {
+    fn query_with_retries(
+        &self,
+        prompt: &str,
+        system_prompt_file: &Path,
+        continue_session: bool,
+        status_tx: Option<&std::sync::mpsc::Sender<String>>,
+    ) -> Result<String> {
         use space_lt_common::{info, warn};
 
         // NOTE: if continue_session=true and a previous attempt was killed mid-response,
         // the Claude CLI session file may be in an inconsistent state. The retry with
         // --continue might fail for that reason. This is a known limitation.
         for attempt in 1..=MAX_RETRIES {
-            match self.query_once(prompt, system_prompt_file, continue_session) {
+            match self.query_once(prompt, system_prompt_file, continue_session, status_tx) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     warn!("[orchestrator] Claude CLI attempt {attempt}/{MAX_RETRIES} failed: {e}");
