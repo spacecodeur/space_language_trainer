@@ -200,8 +200,6 @@ Claude acts as an adaptive English tutor with real-time corrections, diverse sce
 The user enjoys a more natural and responsive voice conversation with lower latency and the ability to interrupt the AI mid-speech.
 - Barge-in: user can interrupt TTS playback by speaking (natural turn-taking)
 - Streaming TTS: sentences synthesized and sent incrementally (reduced perceived latency)
-- TTS GPU evaluation: research alternatives to sherpa-rs for GPU-accelerated TTS (research-only)
-- TTS backend migration: migrate from sherpa-rs to ort + Kokoro ONNX for GPU acceleration via `cudnn_conv_algo_search`
 
 ### Epic Dependencies
 
@@ -214,14 +212,12 @@ Epic 1 (Foundation)
                  6.1 Barge-in                          [done]
                  6.2 Streaming TTS                     [done]
                  6.3 TTS GPU evaluation (research)     [done]
-                 6.4 Migrate TTS to ort + Kokoro ONNX  [ready-for-dev] (depends on 6.3)
                  6.5 Visual Language Feedback          [done]
                  6.6 Session Summary Generation        [done]
                  6.7 Multi-Language Support             [ready-for-dev]
 ```
 
 Story 6.2 (streaming TTS) depends on 6.1 (barge-in) because streaming needs interrupt support to handle mid-stream barge-in correctly.
-Story 6.4 (ort migration) depends on 6.3 (evaluation) which identified ort as the recommended path.
 
 ## Epic 1: Project Foundation & Feasibility Validation
 
