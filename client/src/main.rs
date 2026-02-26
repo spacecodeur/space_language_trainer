@@ -765,6 +765,18 @@ fn tcp_reader_loop(
             }
             ServerMsg::TtsEnd => {
                 debug!("[client] TtsEnd received");
+                // Flush resampler carry-over buffer (sends remaining samples)
+                if let Some(r) = &mut resample {
+                    let tail = r(&[]);
+                    if !tail.is_empty() {
+                        if let Ok(mut buf) = last_tts_audio.lock()
+                            && buf.len() + tail.len() <= REPLAY_BUFFER_MAX_SAMPLES
+                        {
+                            buf.extend_from_slice(&tail);
+                        }
+                        let _ = playback_tx.send(tail);
+                    }
+                }
                 is_playing.store(false, Ordering::SeqCst);
                 let has_audio = last_tts_audio
                     .lock()

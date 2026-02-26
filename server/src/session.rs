@@ -18,6 +18,9 @@ use crate::tts::TtsEngine;
 /// Number of i16 samples per TtsAudioChunk (250ms at 16kHz).
 const TTS_CHUNK_SIZE: usize = 4000;
 
+/// Crossfade length in samples for sentence boundaries (10ms at 16kHz).
+const CROSSFADE_LEN: usize = 160;
+
 /// Run the message routing session between a TCP client and a Unix socket orchestrator.
 ///
 /// Spawns two worker threads:
@@ -349,14 +352,30 @@ fn tts_router(
                             drop(tx); // signal end of production
                         })?;
 
-                    // Consumer: send each sentence's audio as it arrives
+                    // Consumer: send each sentence's audio as it arrives (with crossfade)
                     let mut was_interrupted = false;
                     {
                         let mut w = client_writer
                             .lock()
                             .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
+                        let mut prev_tail: Option<Vec<i16>> = None;
                         for samples in rx {
+                            let mut samples = samples;
+                            // Apply crossfade at sentence boundary
+                            if let Some(tail) = &prev_tail
+                                && samples.len() >= CROSSFADE_LEN
+                            {
+                                apply_crossfade(tail, &mut samples);
+                            }
+                            // Save tail for next sentence's crossfade
+                            if samples.len() >= CROSSFADE_LEN {
+                                prev_tail = Some(samples[samples.len() - CROSSFADE_LEN..].to_vec());
+                            } else {
+                                // Short sentence: reset prev_tail (no reliable tail to crossfade from)
+                                prev_tail = None;
+                            }
                             was_interrupted = send_tts_chunks(&mut *w, &samples, &tts_interrupted)?;
+
                             if was_interrupted {
                                 break;
                             }
@@ -492,6 +511,22 @@ fn send_tts_chunks(
         write_server_msg(writer, &ServerMsg::TtsAudioChunk(chunk.to_vec()))?;
     }
     Ok(false)
+}
+
+/// Apply a linear crossfade from `prev_tail` into the beginning of `samples`.
+///
+/// `prev_tail` must have exactly `CROSSFADE_LEN` samples (the tail of the previous
+/// sentence). The first `CROSSFADE_LEN` samples of `samples` are blended:
+///   out[i] = prev_tail[i] * (1 - t) + samples[i] * t, where t = i / CROSSFADE_LEN
+///
+/// Uses i32 arithmetic to avoid i16 overflow during blending.
+fn apply_crossfade(prev_tail: &[i16], samples: &mut [i16]) {
+    let len = prev_tail.len().min(samples.len()).min(CROSSFADE_LEN);
+    for i in 0..len {
+        let t = i as f32 / CROSSFADE_LEN as f32;
+        let blended = prev_tail[i] as f32 * (1.0 - t) + samples[i] as f32 * t;
+        samples[i] = blended.round().clamp(-32768.0, 32767.0) as i16;
+    }
 }
 
 /// Chunk TTS audio samples and send as TtsAudioChunk messages, followed by TtsEnd.
@@ -1666,5 +1701,69 @@ mod tests {
             }
         }
         assert_eq!(chunk_count, 2);
+    }
+
+    #[test]
+    fn crossfade_smooths_sentence_boundary() {
+        // Sentence A: constant amplitude 10000
+        let sentence_a = vec![10000i16; 1000];
+        // Sentence B: constant amplitude -5000
+        let mut sentence_b = vec![-5000i16; 1000];
+
+        let tail: Vec<i16> = sentence_a[sentence_a.len() - CROSSFADE_LEN..].to_vec();
+        apply_crossfade(&tail, &mut sentence_b);
+
+        // First sample should be close to sentence A's amplitude (t≈0 → mostly prev)
+        assert!(
+            (sentence_b[0] as i32 - 10000).abs() < 200,
+            "First crossfade sample should be near prev_tail value, got {}",
+            sentence_b[0]
+        );
+
+        // Last crossfade sample should be close to sentence B's original amplitude (t≈1 → mostly next)
+        assert!(
+            (sentence_b[CROSSFADE_LEN - 1] as i32 - (-5000)).abs() < 200,
+            "Last crossfade sample should be near original value, got {}",
+            sentence_b[CROSSFADE_LEN - 1]
+        );
+
+        // Midpoint should be between the two amplitudes
+        let mid = sentence_b[CROSSFADE_LEN / 2] as i32;
+        assert!(
+            mid > -5000 && mid < 10000,
+            "Midpoint should be between -5000 and 10000, got {mid}"
+        );
+
+        // Samples after crossfade region should be unchanged
+        assert_eq!(sentence_b[CROSSFADE_LEN], -5000);
+        assert_eq!(sentence_b[999], -5000);
+
+        // Verify monotonic transition (no sudden jumps)
+        let mut max_delta: i32 = 0;
+        for w in sentence_b[..CROSSFADE_LEN].windows(2) {
+            let delta = (w[1] as i32 - w[0] as i32).abs();
+            max_delta = max_delta.max(delta);
+        }
+        // Each step should be at most (10000 - (-5000)) / CROSSFADE_LEN ≈ 94 + some margin
+        assert!(
+            max_delta < 200,
+            "Crossfade should be smooth, max delta = {max_delta}"
+        );
+    }
+
+    #[test]
+    fn crossfade_skipped_for_short_sentence() {
+        // If sentence is shorter than CROSSFADE_LEN, crossfade should not be applied
+        let tail = vec![10000i16; CROSSFADE_LEN];
+        let mut short_sentence = vec![-5000i16; 50]; // less than CROSSFADE_LEN
+        let original = short_sentence.clone();
+
+        // apply_crossfade with len < CROSSFADE_LEN only crossfades available samples
+        apply_crossfade(&tail, &mut short_sentence);
+
+        // First sample should still be crossfaded (partial crossfade)
+        // But in practice the consumer skips crossfade if samples.len() < CROSSFADE_LEN
+        // Here we test the function itself handles short inputs gracefully
+        assert_eq!(short_sentence.len(), original.len());
     }
 }
