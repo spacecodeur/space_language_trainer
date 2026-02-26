@@ -33,9 +33,17 @@ fn find_keyboards() -> Vec<(std::path::PathBuf, String)> {
         .collect()
 }
 
-/// Listen for the hotkey on ALL detected keyboards simultaneously.
-/// Spawns one thread per keyboard device. Any of them pressing the key triggers PTT.
-pub fn listen_all_keyboards(key: KeyCode, is_listening: Arc<AtomicBool>) -> Result<()> {
+/// Listen for the hotkey and optional cancel key on ALL detected keyboards.
+///
+/// Spawns one thread per keyboard device. The hotkey toggles `is_listening`.
+/// If `cancel_key` and `cancel_pressed` are provided, pressing the cancel key
+/// sets `cancel_pressed` to true (one-shot, consumed by the main loop).
+pub fn listen_all_keyboards(
+    key: KeyCode,
+    is_listening: Arc<AtomicBool>,
+    cancel_key: Option<KeyCode>,
+    cancel_pressed: Option<Arc<AtomicBool>>,
+) -> Result<()> {
     let keyboards = find_keyboards();
 
     if keyboards.is_empty() {
@@ -45,6 +53,7 @@ pub fn listen_all_keyboards(key: KeyCode, is_listening: Arc<AtomicBool>) -> Resu
 
     for (path, name) in keyboards {
         let is_listening = is_listening.clone();
+        let cancel_pressed = cancel_pressed.clone();
         let path_display = path.display().to_string();
 
         std::thread::Builder::new()
@@ -67,13 +76,18 @@ pub fn listen_all_keyboards(key: KeyCode, is_listening: Arc<AtomicBool>) -> Resu
                     match device.fetch_events() {
                         Ok(events) => {
                             for event in events {
-                                if event.event_type() == EventType::KEY
-                                    && event.code() == key.code()
-                                    && event.value() == 1
-                                {
+                                if event.event_type() != EventType::KEY || event.value() != 1 {
+                                    continue;
+                                }
+                                if event.code() == key.code() {
                                     // Toggle on key press (not release, not repeat)
                                     let prev = is_listening.load(Ordering::SeqCst);
                                     is_listening.store(!prev, Ordering::SeqCst);
+                                } else if let Some(ck) = cancel_key
+                                    && event.code() == ck.code()
+                                    && let Some(ref flag) = cancel_pressed
+                                {
+                                    flag.store(true, Ordering::SeqCst);
                                 }
                             }
                         }

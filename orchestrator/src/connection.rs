@@ -57,6 +57,9 @@ impl OrchestratorConnection {
             ServerOrcMsg::SummaryRequest => {
                 anyhow::bail!("Unexpected SummaryRequest during session start")
             }
+            ServerOrcMsg::CancelExchange => {
+                anyhow::bail!("Unexpected CancelExchange during session start")
+            }
         }
     }
 

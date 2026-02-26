@@ -18,6 +18,7 @@ pub struct SetupConfig {
     pub device: cpal::Device,
     pub device_name: String,
     pub hotkey: EvdevKeyCode,
+    pub cancel_key: EvdevKeyCode,
     pub voice_mode: VoiceMode,
 }
 
@@ -64,7 +65,22 @@ pub fn run_setup() -> Result<SetupConfig> {
         }
     };
 
-    // Screen 3: Voice Mode selection
+    // Screen 3: Cancel Key selection
+    let cancel_choices = vec![
+        "F5".to_string(),
+        "F6".to_string(),
+        "F7".to_string(),
+        "F8".to_string(),
+    ];
+    let cancel_idx = match select_screen(&mut terminal, "Select Cancel Key", &cancel_choices) {
+        Ok(idx) => idx,
+        Err(e) => {
+            ratatui::restore();
+            return Err(e);
+        }
+    };
+
+    // Screen 4: Voice Mode selection
     let mode_choices = vec![
         "Manual (hotkey controls when to send)".to_string(),
         "Auto (VAD segments on silence)".to_string(),
@@ -97,11 +113,20 @@ pub fn run_setup() -> Result<SetupConfig> {
         _ => EvdevKeyCode::KEY_F2,
     };
 
+    let cancel_key = match cancel_idx {
+        0 => EvdevKeyCode::KEY_F5,
+        1 => EvdevKeyCode::KEY_F6,
+        2 => EvdevKeyCode::KEY_F7,
+        3 => EvdevKeyCode::KEY_F8,
+        _ => EvdevKeyCode::KEY_F5,
+    };
+
     Ok(SetupConfig {
         server_addr,
         device,
         device_name,
         hotkey,
+        cancel_key,
         voice_mode,
     })
 }

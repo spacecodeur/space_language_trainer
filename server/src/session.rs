@@ -199,6 +199,10 @@ fn stt_router(
                 info!("[server] Summary requested by client, forwarding to orchestrator");
                 write_orchestrator_msg(&mut writer, &OrchestratorMsg::SummaryRequest)?;
             }
+            ClientMsg::CancelExchange => {
+                info!("[server] CancelExchange received, forwarding to orchestrator");
+                write_orchestrator_msg(&mut writer, &OrchestratorMsg::CancelExchange)?;
+            }
         }
     }
 
@@ -441,6 +445,9 @@ fn tts_router(
                     .lock()
                     .map_err(|e| anyhow::anyhow!("client writer poisoned: {e}"))?;
                 write_server_msg(&mut *w, &ServerMsg::StatusNotification(text))?;
+            }
+            OrchestratorMsg::CancelExchange => {
+                debug!("[server] Unexpected CancelExchange in tts_router (ignoring)");
             }
         }
     }

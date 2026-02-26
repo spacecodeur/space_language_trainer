@@ -25,6 +25,7 @@ pub enum ClientMsg {
     InterruptTts,           // tag 0x04, empty payload
     FeedbackChoice(bool),   // tag 0x05, payload = 1 byte (0x01=continue, 0x00=retry)
     SummaryRequest,         // tag 0x06, empty payload
+    CancelExchange,         // tag 0x07, empty payload
 }
 
 // --- Server messages (server → client, tags 0x80-0xFF) ---
@@ -54,6 +55,7 @@ pub enum OrchestratorMsg {
     SummaryRequest,             // tag 0xA6, empty payload
     SummaryResponse(String),    // tag 0xA7, payload = UTF-8 markdown
     StatusNotification(String), // tag 0xA8, payload = UTF-8 (e.g. "Thinking...", "Searching the web...")
+    CancelExchange,             // tag 0xA9, empty payload
 }
 
 // --- Server-to-Orchestrator messages (read by orchestrator, combines server + orchestrator tags) ---
@@ -65,6 +67,7 @@ pub enum ServerOrcMsg {
     TranscribedText(String), // tag 0xA0, payload = UTF-8
     FeedbackChoice(bool),    // tag 0xA5, payload = 1 byte (0x01=continue, 0x00=retry)
     SummaryRequest,          // tag 0xA6, empty payload
+    CancelExchange,          // tag 0xA9, empty payload
 }
 
 // --- Wire format: [tag: u8][length: u32 LE][payload] ---
@@ -103,6 +106,11 @@ pub fn write_client_msg(w: &mut impl Write, msg: &ClientMsg) -> Result<()> {
         }
         ClientMsg::SummaryRequest => {
             w.write_all(&[0x06])?;
+            w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
+        ClientMsg::CancelExchange => {
+            w.write_all(&[0x07])?;
             w.write_all(&0u32.to_le_bytes())?;
             w.flush()?;
         }
@@ -164,6 +172,13 @@ pub fn read_client_msg(r: &mut impl Read) -> Result<ClientMsg> {
                 r.read_exact(&mut discard)?;
             }
             Ok(ClientMsg::SummaryRequest)
+        }
+        0x07 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ClientMsg::CancelExchange)
         }
         other => bail!("Unknown client message tag: 0x{other:02x}"),
     }
@@ -353,6 +368,11 @@ pub fn write_orchestrator_msg(w: &mut impl Write, msg: &OrchestratorMsg) -> Resu
             w.write_all(payload)?;
             w.flush()?;
         }
+        OrchestratorMsg::CancelExchange => {
+            w.write_all(&[0xA9])?;
+            w.write_all(&0u32.to_le_bytes())?;
+            w.flush()?;
+        }
     }
     Ok(())
 }
@@ -422,6 +442,13 @@ pub fn read_orchestrator_msg(r: &mut impl Read) -> Result<OrchestratorMsg> {
                 payload,
             )?))
         }
+        0xA9 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(OrchestratorMsg::CancelExchange)
+        }
         other => bail!("Unknown orchestrator message tag: 0x{other:02x}"),
     }
 }
@@ -469,6 +496,13 @@ pub fn read_server_orc_msg(r: &mut impl Read) -> Result<ServerOrcMsg> {
                 r.read_exact(&mut discard)?;
             }
             Ok(ServerOrcMsg::SummaryRequest)
+        }
+        0xA9 => {
+            if len > 0 {
+                let mut discard = vec![0u8; len];
+                r.read_exact(&mut discard)?;
+            }
+            Ok(ServerOrcMsg::CancelExchange)
         }
         other => bail!("Unknown server-to-orchestrator message tag: 0x{other:02x}"),
     }
@@ -1104,6 +1138,33 @@ mod tests {
             ServerMsg::StatusNotification(decoded) => assert_eq!(decoded, text),
             other => panic!("Expected StatusNotification, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn round_trip_cancel_exchange_client() {
+        let mut buf = Vec::new();
+        write_client_msg(&mut buf, &ClientMsg::CancelExchange).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_client_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ClientMsg::CancelExchange));
+    }
+
+    #[test]
+    fn round_trip_cancel_exchange_orchestrator() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::CancelExchange).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_orchestrator_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, OrchestratorMsg::CancelExchange));
+    }
+
+    #[test]
+    fn read_server_orc_msg_cancel_exchange() {
+        let mut buf = Vec::new();
+        write_orchestrator_msg(&mut buf, &OrchestratorMsg::CancelExchange).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let msg = read_server_orc_msg(&mut cursor).unwrap();
+        assert!(matches!(msg, ServerOrcMsg::CancelExchange));
     }
 
     #[test]
