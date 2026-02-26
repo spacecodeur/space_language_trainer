@@ -148,12 +148,13 @@ impl ClaudeCliBackend {
         let mut cmd = Command::new("claude");
         cmd.arg("-p");
 
+        // Always pass system prompt so profile/instructions are available on every turn
+        let system_prompt =
+            std::fs::read_to_string(system_prompt_file).context("reading system prompt file")?;
+        cmd.args(["--system-prompt", &system_prompt]);
+
         if continue_session {
             cmd.arg("--continue");
-        } else {
-            let system_prompt = std::fs::read_to_string(system_prompt_file)
-                .context("reading system prompt file")?;
-            cmd.args(["--system-prompt", &system_prompt]);
         }
 
         cmd.args(["--output-format", "text", "--allowedTools", ALLOWED_TOOLS]);
