@@ -202,7 +202,6 @@ The user enjoys a more natural and responsive voice conversation with lower late
 - Streaming TTS: sentences synthesized and sent incrementally (reduced perceived latency)
 - TTS GPU evaluation: research alternatives to sherpa-rs for GPU-accelerated TTS (research-only)
 - TTS backend migration: migrate from sherpa-rs to ort + Kokoro ONNX for GPU acceleration via `cudnn_conv_algo_search`
-- Chatterbox Turbo evaluation: integrate and benchmark Chatterbox Turbo (350M, Elo 2055) as alternative TTS backend
 
 ### Epic Dependencies
 
@@ -219,12 +218,10 @@ Epic 1 (Foundation)
                  6.5 Visual Language Feedback          [done]
                  6.6 Session Summary Generation        [done]
                  6.7 Multi-Language Support             [ready-for-dev]
-                 6.8 Chatterbox Turbo TTS Evaluation   [ready-for-dev] (depends on 6.4)
 ```
 
 Story 6.2 (streaming TTS) depends on 6.1 (barge-in) because streaming needs interrupt support to handle mid-stream barge-in correctly.
 Story 6.4 (ort migration) depends on 6.3 (evaluation) which identified ort as the recommended path.
-Story 6.8 (Chatterbox Turbo) depends on 6.4 (ort migration) which establishes the ort infrastructure reused by Chatterbox.
 
 ## Epic 1: Project Foundation & Feasibility Validation
 
