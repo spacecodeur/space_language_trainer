@@ -15,9 +15,6 @@ use crate::claude::LlmBackend;
 /// especially when using web search. This inline reminder keeps it on track.
 const FORMAT_REMINDER: &str = "[CRITICAL: Your response is spoken aloud by TTS. Write ONLY plain conversational sentences. No markdown, no formatting, no lists, no URLs, no sources. 1-3 sentences max. If you notice grammar errors or unnatural phrasing, prepend a [FEEDBACK] block. Inside the block, every line MUST start with RED:, BLUE:, or CORRECTED: — never write prose. Example:\n[FEEDBACK]\nRED: \"I have went\" → \"I went\" (past simple)\nCORRECTED: I <<went>> to the store.\n[/FEEDBACK]\nYour spoken reply here.\nIf the user asks to speak slower/faster/normal, you MUST prefix your response with [SPEED:X.X] (0.5=much slower, 0.6=slower, 0.8=normal, 1.0=faster). You DO control speech speed via this tag. Speed persists until changed — to return to normal, use [SPEED:0.8].]\n\n";
 
-/// Context injected when the user cancels an exchange (discard previous turn).
-const CANCEL_CONTEXT: &str = "[The user cancelled the previous exchange. Discard it entirely — do not reference it, quote it, or follow up on it. Treat the next message as a fresh conversational turn.]\n\n";
-
 /// Prompt for generating a structured session summary in markdown.
 /// Sent with continue_session=true so Claude has full conversation context.
 /// Does NOT include FORMAT_REMINDER — this produces markdown, not voice.
@@ -97,9 +94,8 @@ pub fn run_voice_loop(
     let mut turn_count: u32 = 0;
     let mut state = VoiceLoopState::WaitingForTranscription;
     let mut retry_context: Option<String> = None;
-    let mut cancel_context: Option<String> = None;
 
-    'outer: loop {
+    loop {
         // 1. Wait for transcribed text from server
         let msg = match read_server_orc_msg(reader) {
             Ok(msg) => msg,
@@ -141,11 +137,6 @@ pub fn run_voice_loop(
                 write_orchestrator_msg(writer, &OrchestratorMsg::SummaryResponse(summary))?;
                 break;
             }
-            ServerOrcMsg::CancelExchange => {
-                info!("[orchestrator] Exchange cancelled by user (post-response)");
-                cancel_context = Some(CANCEL_CONTEXT.to_string());
-                continue;
-            }
         };
 
         // 2. Query LLM
@@ -162,10 +153,8 @@ pub fn run_voice_loop(
             &OrchestratorMsg::StatusNotification("Thinking...".to_string()),
         );
 
-        // Prepend cancel or retry context if applicable (cancel takes priority)
-        let augmented_prompt = if let Some(ctx) = cancel_context.take() {
-            format!("{FORMAT_REMINDER}{ctx}{text}")
-        } else if let Some(ctx) = retry_context.take() {
+        // Prepend retry context if user chose to rephrase on previous turn
+        let augmented_prompt = if let Some(ctx) = retry_context.take() {
             format!("{FORMAT_REMINDER}{ctx}{text}")
         } else {
             format!("{FORMAT_REMINDER}{text}")
@@ -240,13 +229,6 @@ pub fn run_voice_loop(
                 };
                 match choice_msg {
                     ServerOrcMsg::FeedbackChoice(proceed) => break Some(proceed),
-                    ServerOrcMsg::CancelExchange => {
-                        info!("[orchestrator] Exchange cancelled by user (during feedback)");
-                        cancel_context = Some(CANCEL_CONTEXT.to_string());
-                        state = VoiceLoopState::WaitingForTranscription;
-                        info!("[orchestrator] State: WaitingForTts → {state}");
-                        continue 'outer;
-                    }
                     other => {
                         warn!(
                             "[orchestrator] Ignoring unexpected message while waiting for FeedbackChoice: {other:?}"
@@ -804,117 +786,6 @@ mod tests {
         let backend = MockLlmBackend::new(vec![
             "Great conversation!".to_string(),
             "Mock summary".to_string(),
-        ]);
-        let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
-        let mut writer = BufWriter::new(orch_stream);
-        let agent_path = PathBuf::from("agent.md");
-
-        let result = run_voice_loop(&mut reader, &mut writer, &backend, &agent_path);
-        assert!(result.is_ok());
-
-        server_handle.join().unwrap();
-    }
-
-    #[test]
-    fn voice_loop_cancel_during_feedback_skips_response() {
-        let (orch_stream, server_stream) = UnixStream::pair().unwrap();
-
-        let server_handle = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
-            let mut writer = BufWriter::new(server_stream);
-
-            // Turn 1: user speaks with error → feedback
-            write_orchestrator_msg(
-                &mut writer,
-                &OrchestratorMsg::TranscribedText("I have went to store".into()),
-            )
-            .unwrap();
-
-            // Read FeedbackText (skipping StatusNotification)
-            let msg = read_next_non_status(&mut reader);
-            assert!(matches!(msg, OrchestratorMsg::FeedbackText(_)));
-
-            // Send CancelExchange instead of FeedbackChoice
-            write_orchestrator_msg(&mut writer, &OrchestratorMsg::CancelExchange).unwrap();
-
-            // No ResponseText should come — orchestrator skips it on cancel
-
-            // Turn 2: user speaks again
-            write_orchestrator_msg(
-                &mut writer,
-                &OrchestratorMsg::TranscribedText("What's the weather today?".into()),
-            )
-            .unwrap();
-
-            // Should get ResponseText for turn 2 (skipping StatusNotification)
-            let msg = read_next_non_status(&mut reader);
-            match msg {
-                OrchestratorMsg::ResponseText(t) => assert_eq!(t, "It's sunny today!"),
-                other => panic!("Expected ResponseText, got {other:?}"),
-            }
-
-            drop(writer);
-            drop(reader);
-        });
-
-        let backend = MockLlmBackend::new(vec![
-            "[FEEDBACK]\nRED: \"I have went\" → \"I went\"\n[/FEEDBACK]\nNice try!".to_string(),
-            "It's sunny today!".to_string(),
-        ]);
-        let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
-        let mut writer = BufWriter::new(orch_stream);
-        let agent_path = PathBuf::from("agent.md");
-
-        let result = run_voice_loop(&mut reader, &mut writer, &backend, &agent_path);
-        assert!(result.is_ok());
-
-        server_handle.join().unwrap();
-    }
-
-    #[test]
-    fn voice_loop_cancel_post_response_continues_normally() {
-        let (orch_stream, server_stream) = UnixStream::pair().unwrap();
-
-        let server_handle = std::thread::spawn(move || {
-            let mut reader = BufReader::new(server_stream.try_clone().unwrap());
-            let mut writer = BufWriter::new(server_stream);
-
-            // Turn 1: normal exchange (no feedback)
-            write_orchestrator_msg(
-                &mut writer,
-                &OrchestratorMsg::TranscribedText("Tell me about NZ".into()),
-            )
-            .unwrap();
-
-            let msg = read_next_non_status(&mut reader);
-            match msg {
-                OrchestratorMsg::ResponseText(t) => assert_eq!(t, "NZ is great!"),
-                other => panic!("Expected ResponseText, got {other:?}"),
-            }
-
-            // User cancels after response was already sent
-            write_orchestrator_msg(&mut writer, &OrchestratorMsg::CancelExchange).unwrap();
-
-            // Turn 2: user speaks again — cancel context should be injected
-            write_orchestrator_msg(
-                &mut writer,
-                &OrchestratorMsg::TranscribedText("What's for dinner?".into()),
-            )
-            .unwrap();
-
-            let msg = read_next_non_status(&mut reader);
-            match msg {
-                OrchestratorMsg::ResponseText(t) => assert_eq!(t, "Pizza sounds good!"),
-                other => panic!("Expected ResponseText, got {other:?}"),
-            }
-
-            drop(writer);
-            drop(reader);
-        });
-
-        let backend = MockLlmBackend::new(vec![
-            "NZ is great!".to_string(),
-            "Pizza sounds good!".to_string(),
         ]);
         let mut reader = BufReader::new(orch_stream.try_clone().unwrap());
         let mut writer = BufWriter::new(orch_stream);

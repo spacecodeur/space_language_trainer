@@ -99,11 +99,6 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     let is_playing = Arc::new(AtomicBool::new(false));
     let is_playing_reader = is_playing.clone();
 
-    // 5b. Cancel flags
-    let cancel_pressed = Arc::new(AtomicBool::new(false));
-    let cancel_requested = Arc::new(AtomicBool::new(false));
-    let cancel_requested_reader = cancel_requested.clone();
-
     // 6. Spawn tcp_reader thread
     let tcp_shutdown = shutdown.clone();
     let (summary_tx, summary_rx) = crossbeam_channel::bounded::<String>(1);
@@ -119,7 +114,6 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                 is_playing_reader,
                 summary_tx,
                 last_tts_audio_writer,
-                cancel_requested_reader,
             )
         })?;
 
@@ -129,14 +123,9 @@ fn run_client(server_override: Option<String>) -> Result<()> {
     let mut resample =
         audio::create_resampler(capture_config.sample_rate, 16000, capture_config.channels)?;
 
-    // 8. Hotkey + cancel key
+    // 8. Hotkey
     let is_listening = Arc::new(AtomicBool::new(false));
-    hotkey::listen_all_keyboards(
-        config.hotkey,
-        is_listening.clone(),
-        Some(config.cancel_key),
-        Some(cancel_pressed.clone()),
-    )?;
+    hotkey::listen_all_keyboards(config.hotkey, is_listening.clone())?;
 
     // 9. Ctrl+C handler
     let shutdown_clone = shutdown.clone();
@@ -146,10 +135,6 @@ fn run_client(server_override: Option<String>) -> Result<()> {
 
     // 10. Main audio/VAD loop
     info!("Ready! Press {:?} to toggle listening.", config.hotkey);
-    info!(
-        "Press {:?} to cancel the current response.",
-        config.cancel_key
-    );
 
     let voice_mode = config.voice_mode;
     let mut voice_detector = vad::VoiceDetector::new()?;
@@ -165,34 +150,7 @@ fn run_client(server_override: Option<String>) -> Result<()> {
             break;
         }
 
-        // Check evdev cancel key (works during TTS and idle)
-        if cancel_pressed
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            if is_playing.load(Ordering::SeqCst) {
-                // During TTS: interrupt audio + cancel exchange
-                info!("[CANCELLED]");
-                let _ = write_client_msg(&mut writer, &ClientMsg::InterruptTts);
-                let _ = write_client_msg(&mut writer, &ClientMsg::CancelExchange);
-                is_playing.store(false, Ordering::SeqCst);
-                playback_clear.store(true, Ordering::SeqCst);
-                cancel_requested.store(true, Ordering::SeqCst);
-                if let Ok(mut buf) = last_tts_audio.lock() {
-                    buf.clear();
-                }
-            } else if !is_listening.load(Ordering::SeqCst) {
-                // After TTS (idle) or during feedback: cancel exchange
-                info!("[CANCELLED]");
-                let _ = write_client_msg(&mut writer, &ClientMsg::CancelExchange);
-                cancel_requested.store(true, Ordering::SeqCst);
-                if let Ok(mut buf) = last_tts_audio.lock() {
-                    buf.clear();
-                }
-            }
-        }
-
-        // Check for 'q' (quit), '3' (replay), or '4' (cancel) when not listening
+        // Check for 'q' (quit) or '3' (replay) when not listening
         if !is_listening.load(Ordering::SeqCst) {
             match poll_key_action() {
                 PollAction::Quit => {
@@ -203,21 +161,6 @@ fn run_client(server_override: Option<String>) -> Result<()> {
                 PollAction::Replay => {
                     if !is_playing.load(Ordering::SeqCst) {
                         replay_last_audio(&last_tts_audio, &replay_tx);
-                    }
-                }
-                PollAction::Cancel => {
-                    if !is_playing.load(Ordering::SeqCst) {
-                        let has_audio = last_tts_audio
-                            .lock()
-                            .map(|b| !b.is_empty())
-                            .unwrap_or(false);
-                        if has_audio {
-                            info!("[CANCELLED]");
-                            let _ = write_client_msg(&mut writer, &ClientMsg::CancelExchange);
-                            if let Ok(mut buf) = last_tts_audio.lock() {
-                                buf.clear();
-                            }
-                        }
                     }
                 }
                 PollAction::None => {}
@@ -441,10 +384,9 @@ enum PollAction {
     None,
     Quit,
     Replay,
-    Cancel,
 }
 
-/// Check for 'q' (quit), '3' (replay), or '4' (cancel) key press using crossterm polling (non-blocking).
+/// Check for 'q' (quit) or '3' (replay) key press using crossterm polling (non-blocking).
 fn poll_key_action() -> PollAction {
     use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
     use crossterm::terminal;
@@ -469,11 +411,6 @@ fn poll_key_action() -> PollAction {
                 kind: KeyEventKind::Press,
                 ..
             })) => PollAction::Replay,
-            Ok(Event::Key(KeyEvent {
-                code: KeyCode::Char('4'),
-                kind: KeyEventKind::Press,
-                ..
-            })) => PollAction::Cancel,
             _ => PollAction::None,
         }
     } else {
@@ -576,16 +513,11 @@ enum FeedbackAction {
     Continue,
     Retry,
     Replay,
-    Cancel,
 }
 
 /// Read a single keypress for feedback choice (no Enter needed).
-/// Returns Continue ('1'), Retry ('2'), Replay ('3'), or Cancel ('4'/Esc).
-/// Also checks `cancel_requested` for evdev cancel key pressed from main loop.
-fn read_feedback_choice(
-    shutdown: &Arc<AtomicBool>,
-    cancel_requested: &Arc<AtomicBool>,
-) -> FeedbackAction {
+/// Returns Continue ('1'), Retry ('2'), or Replay ('3').
+fn read_feedback_choice(shutdown: &Arc<AtomicBool>) -> FeedbackAction {
     use crossterm::event::{self, Event, KeyCode, KeyEvent};
     use crossterm::terminal;
 
@@ -596,7 +528,6 @@ fn read_feedback_choice(
         return match input.trim() {
             "2" => FeedbackAction::Retry,
             "3" => FeedbackAction::Replay,
-            "4" => FeedbackAction::Cancel,
             _ => FeedbackAction::Continue,
         };
     }
@@ -605,19 +536,14 @@ fn read_feedback_choice(
         if shutdown.load(Ordering::SeqCst) {
             break FeedbackAction::Continue;
         }
-        // Check if evdev cancel key was pressed (set by main loop)
-        if cancel_requested.load(Ordering::SeqCst) {
-            break FeedbackAction::Cancel;
-        }
-        // Poll with timeout so we can check shutdown + cancel_requested
-        if event::poll(Duration::from_millis(200)).unwrap_or(false)
+        // Poll with timeout so we can check shutdown
+        if event::poll(Duration::from_millis(500)).unwrap_or(false)
             && let Ok(Event::Key(KeyEvent { code, .. })) = event::read()
         {
             break match code {
                 KeyCode::Char('1') => FeedbackAction::Continue,
                 KeyCode::Char('2') => FeedbackAction::Retry,
                 KeyCode::Char('3') => FeedbackAction::Replay,
-                KeyCode::Char('4') | KeyCode::Esc => FeedbackAction::Cancel,
                 _ => continue, // ignore other keys
             };
         }
@@ -780,7 +706,6 @@ fn tcp_reader_loop(
     is_playing: Arc<AtomicBool>,
     summary_tx: crossbeam_channel::Sender<String>,
     last_tts_audio: Arc<std::sync::Mutex<Vec<i16>>>,
-    cancel_requested: Arc<AtomicBool>,
 ) {
     // Create resampler if playback device isn't 16kHz
     let mut resample: Option<audio::ResamplerFn> = if output_rate != 16000 {
@@ -819,10 +744,6 @@ fn tcp_reader_loop(
         match msg {
             ServerMsg::TtsAudioChunk(samples) => {
                 debug!("[client] TtsAudioChunk: {} samples", samples.len());
-                // Clear stale cancel from previous exchange on first chunk
-                if !is_playing.load(Ordering::SeqCst) {
-                    cancel_requested.store(false, Ordering::SeqCst);
-                }
                 is_playing.store(true, Ordering::SeqCst);
                 let output = match &mut resample {
                     Some(r) => r(&samples),
@@ -854,34 +775,23 @@ fn tcp_reader_loop(
                     }
                 }
                 is_playing.store(false, Ordering::SeqCst);
-                // If cancel was triggered during TTS, skip feedback/replay
-                if cancel_requested
-                    .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    if let Ok(mut buf) = last_tts_audio.lock() {
-                        buf.clear();
-                    }
-                    continue;
-                }
                 let has_audio = last_tts_audio
                     .lock()
                     .map(|buf| !buf.is_empty())
                     .unwrap_or(false);
                 if has_audio {
-                    eprintln!("  \x1b[2m[3] Replay  [4] Cancel\x1b[0m");
+                    eprintln!("  \x1b[2m[3] Replay\x1b[0m");
                 }
             }
             ServerMsg::Ready => {
                 debug!("[client] Unexpected Ready (ignoring)");
             }
             ServerMsg::Text(text) => {
-                // Clear replay buffer and stale cancel when a new AI response starts
-                if text.starts_with("AI:") {
-                    cancel_requested.store(false, Ordering::SeqCst);
-                    if let Ok(mut buf) = last_tts_audio.lock() {
-                        buf.clear();
-                    }
+                // Clear replay buffer when a new AI response starts
+                if text.starts_with("AI:")
+                    && let Ok(mut buf) = last_tts_audio.lock()
+                {
+                    buf.clear();
                 }
                 info!("[client] {text}");
             }
@@ -892,67 +802,35 @@ fn tcp_reader_loop(
                 display_feedback(&text);
 
                 // Feedback choice loop (supports replay before deciding)
-                // None = cancel, Some(true) = continue, Some(false) = retry
-                let feedback_result: Option<bool> = loop {
-                    eprintln!("  \x1b[1m[1] Continue  [2] Retry  [3] Replay  [4] Cancel\x1b[0m");
+                let proceed = loop {
+                    eprintln!("  \x1b[1m[1] Continue  [2] Retry and re-speak  [3] Replay\x1b[0m");
                     eprint!("  > ");
                     let _ = std::io::stderr().flush();
 
-                    match read_feedback_choice(&shutdown, &cancel_requested) {
+                    match read_feedback_choice(&shutdown) {
                         FeedbackAction::Replay => {
                             replay_last_audio(&last_tts_audio, &playback_tx);
                         }
-                        FeedbackAction::Continue => break Some(true),
-                        FeedbackAction::Retry => break Some(false),
-                        FeedbackAction::Cancel => break None,
+                        FeedbackAction::Continue => break true,
+                        FeedbackAction::Retry => break false,
                     }
                 };
 
-                match feedback_result {
-                    Some(proceed) => {
-                        if let Err(e) = write_client_msg(
-                            &mut feedback_writer,
-                            &ClientMsg::FeedbackChoice(proceed),
-                        ) {
-                            if is_disconnect(&e) {
-                                debug!("[client] Server disconnected while sending FeedbackChoice");
-                                shutdown.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                            warn!("[client] Failed to send FeedbackChoice: {e}");
-                        }
-                        if proceed {
-                            info!("[client] Continuing with AI response...");
-                        } else {
-                            info!("[client] Retrying — please re-speak your sentence.");
-                        }
+                if let Err(e) =
+                    write_client_msg(&mut feedback_writer, &ClientMsg::FeedbackChoice(proceed))
+                {
+                    if is_disconnect(&e) {
+                        debug!("[client] Server disconnected while sending FeedbackChoice");
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
                     }
-                    None => {
-                        // Cancel: check if evdev cancel already sent CancelExchange
-                        let from_evdev = cancel_requested
-                            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok();
-                        if !from_evdev {
-                            // Crossterm '4'/Esc — send CancelExchange ourselves
-                            info!("[CANCELLED]");
-                            if let Err(e) =
-                                write_client_msg(&mut feedback_writer, &ClientMsg::CancelExchange)
-                            {
-                                if is_disconnect(&e) {
-                                    debug!(
-                                        "[client] Server disconnected while sending CancelExchange"
-                                    );
-                                    shutdown.store(true, Ordering::SeqCst);
-                                    break;
-                                }
-                                warn!("[client] Failed to send CancelExchange: {e}");
-                            }
-                            if let Ok(mut buf) = last_tts_audio.lock() {
-                                buf.clear();
-                            }
-                        }
-                        // Don't send FeedbackChoice — orchestrator handles CancelExchange
-                    }
+                    warn!("[client] Failed to send FeedbackChoice: {e}");
+                }
+
+                if proceed {
+                    info!("[client] Continuing with AI response...");
+                } else {
+                    info!("[client] Retrying — please re-speak your sentence.");
                 }
             }
             ServerMsg::StatusNotification(text) => {
